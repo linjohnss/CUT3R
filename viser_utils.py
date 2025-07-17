@@ -20,7 +20,7 @@ from src.dust3r.viz import (
     pts3d_to_trimesh,
     cat_meshes,
 )
-
+import matplotlib.colors as mcolors
 
 def todevice(batch, device, callback=None, non_blocking=False):
     """Transfer some variables to another device (i.e. GPU, CPU:torch, CPU:numpy).
@@ -569,6 +569,7 @@ class PointCloudViewer:
                     position=client.camera.position,
                     scale=0.1,
                     color=[64, 179, 230],
+                    image=self.orig_img_list[self.num_frames-1]
                 )
                 print("Adding new pointcloud: ", pts3ds.shape)
             except Exception as e:
@@ -671,6 +672,10 @@ class PointCloudViewer:
         R = cam["R"][step]
         t = cam["t"][step]
 
+        hue = step / max(1, self.num_frames - 1)
+        rainbow_color = mcolors.hsv_to_rgb((hue, 1, 1))
+        rainbow_color = tuple(rainbow_color.tolist())
+
         q = tf.SO3.from_matrix(R).wxyz
         fov = 2 * np.arctan(pp[0] / focal)
         aspect = pp[0] / pp[1]
@@ -683,7 +688,8 @@ class PointCloudViewer:
                 wxyz=q,
                 position=t,
                 scale=0.1,
-                color=(50, 205, 50),
+                color=rainbow_color,
+                image=self.orig_img_list[step][::4, ::4]
             )
         )
 
@@ -763,11 +769,12 @@ class PointCloudViewer:
                     gui_timestep.value = (gui_timestep.value + 1) % self.num_frames
 
                 for i, frame_node in enumerate(self.frame_nodes):
-                    frame_node.visible = (
-                        i <= gui_timestep.value
-                        if not self.fourd
-                        else i == gui_timestep.value
-                    )
+                    if i % 10 == 0:
+                        frame_node.visible = (
+                            i <= gui_timestep.value
+                            if not self.fourd
+                            else i == gui_timestep.value
+                        )
 
             time.sleep(1.0 / gui_framerate.value)
 

@@ -58,6 +58,13 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
 
+# Import LoRA utilities
+from lora_utils import (
+    get_lora_state_dict,
+    load_lora_state_dict,
+    freeze_non_lora_parameters,
+)
+
 
 def setup_for_distributed(accelerator: Accelerator):
     """
@@ -172,7 +179,27 @@ def train(args):
     # model
     printer.info("Loading model: %s", args.model)
     model: PreTrainedModel = eval(args.model)
+    
+    if getattr(model, 'config', None) and getattr(model.config, 'enable_lora', False):
+        printer.info("=== LoRA MODEL ANALYSIS ===")
+        cfg = model.config
+        printer.info(f"LoRA enabled: {cfg.enable_lora}, rank: {cfg.lora_rank}, alpha: {cfg.lora_alpha}, dropout: {cfg.lora_dropout}")
+
+        lora_layers = [name for name, module in model.named_modules() if 'LoRA' in str(type(module))]
+        if lora_layers:
+            printer.info(f"✅ LoRA successfully applied to {len(lora_layers)} layers")
+            for name in lora_layers:
+                printer.info(f"Found LoRA layer: {name}")
+        else:
+            printer.warning("❌ NO LoRA LAYERS FOUND! This means LoRA was not applied correctly.")
+            printer.warning("The model will train normally but won't generate LoRA weights.")
+            # Show up to 10 Linear layer names for debugging
+            linear_names = [name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)]
+            printer.info("Sample linear layer names in model: " + ", ".join(linear_names[:10]))
+        printer.info("=== END LoRA ANALYSIS ===")
+    
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
+    printer.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     printer.info(
         f"Encoder parameters: {sum(p.numel() for p in model.enc_blocks.parameters())}"
     )
@@ -190,28 +217,79 @@ def train(args):
     model.to(device)
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        # Check if this is LoRA training
+        is_lora_model = (hasattr(model, 'config') and 
+                        hasattr(model.config, 'enable_lora') and 
+                        model.config.enable_lora)
+        
+        if is_lora_model:
+            # FORCE disable gradient checkpointing for LoRA
+            # Gradient checkpointing is incompatible with frozen parameters
+            printer.warning("⚠️  FORCE disabling gradient checkpointing for LoRA training")
+            printer.warning("   Gradient checkpointing conflicts with frozen parameters in LoRA mode")
+            args.gradient_checkpointing = False
+            # Also disable on model
+            if hasattr(model, 'gradient_checkpointing'):
+                model.gradient_checkpointing = False
+        else:
+            printer.info("Enabling gradient checkpointing for standard training")
+            model.gradient_checkpointing_enable()
+    else:
+        printer.info("Gradient checkpointing disabled")
+        # Ensure it's disabled on model too
+        if hasattr(model, 'gradient_checkpointing'):
+            model.gradient_checkpointing = False
+    
     if args.long_context:
         model.fixed_input_length = False
 
-    if args.pretrained and not args.resume:
-        printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
-        load_only_encoder = getattr(args, "load_only_encoder", False)
-        if load_only_encoder:
-            filtered_state_dict = {
-                k: v
-                for k, v in ckpt["model"].items()
-                if "enc_blocks" in k or "patch_embed" in k
-            }
-            printer.info(
-                model.load_state_dict(strip_module(filtered_state_dict), strict=False)
-            )
-        else:
-            printer.info(
-                model.load_state_dict(strip_module(ckpt["model"]), strict=False)
-            )
-        del ckpt  # in case it occupies memory
+    if getattr(model, '_lora_config', None):
+        lora_config = model._lora_config
+        printer.info(f"=== APPLYING LORA TO MODEL ===\n"
+                     f"LoRA config: rank={lora_config['lora_rank']}, alpha={lora_config['lora_alpha']}, "
+                     f"dropout={lora_config['lora_dropout']}, targets={lora_config['lora_target_modules']}")
+        # Apply LoRA
+        model.apply_lora(
+            rank=lora_config['lora_rank'],
+            alpha=lora_config['lora_alpha'],
+            dropout=lora_config['lora_dropout'],
+            target_modules=lora_config['lora_target_modules'],
+        )
+        # Load pretrained weights if needed
+        if args.pretrained and not args.resume:
+            printer.info(f"Loading pretrained: {args.pretrained}")
+            ckpt = torch.load(args.pretrained, map_location=device)
+            load_only_encoder = getattr(args, "load_only_encoder", False)
+            state_dict = ckpt["model"]
+            if load_only_encoder:
+                state_dict = {k: v for k, v in state_dict.items() if "enc_blocks" in k or "patch_embed" in k}
+            del ckpt
+        # Freeze non-LoRA parameters
+        freeze_non_lora_parameters(model)
+        # Print parameter info
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        printer.info(f"After LoRA: {trainable:,} trainable / {total:,} total parameters")
+        printer.info("=== END LORA APPLICATION ===")
+    else:
+        if args.pretrained and not args.resume:
+            printer.info(f"Loading pretrained: {args.pretrained}")
+            ckpt = torch.load(args.pretrained, map_location=device)
+            load_only_encoder = getattr(args, "load_only_encoder", False)
+            if load_only_encoder:
+                filtered_state_dict = {
+                    k: v
+                    for k, v in ckpt["model"].items()
+                    if "enc_blocks" in k or "patch_embed" in k
+                }
+                printer.info(
+                    model.load_state_dict(strip_module(filtered_state_dict), strict=False)
+                )
+            else:
+                printer.info(
+                    model.load_state_dict(strip_module(ckpt["model"]), strict=False)
+                )
+            del ckpt  # in case it occupies memory
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
@@ -223,7 +301,50 @@ def train(args):
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
-
+    
+    # CRITICAL: Re-confirm LoRA parameters after accelerator.prepare()
+    actual_model = accelerator.unwrap_model(model)
+    if getattr(actual_model, '_lora_config', None):
+        printer.info("=== RE-CONFIRMING LORA PARAMETERS AFTER ACCELERATOR ===")
+        
+        # Freeze non-LoRA parameters (handle multi-GPU sync)
+        if accelerator.num_processes > 1:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                freeze_non_lora_parameters(actual_model)
+            accelerator.wait_for_everyone()
+            # Broadcast requires_grad settings to all processes
+            for name, param in actual_model.named_parameters():
+                param.requires_grad = "lora_A" in name or "lora_B" in name
+        else:
+            freeze_non_lora_parameters(actual_model)
+        
+        # Verify LoRA parameters are trainable and in optimizer
+        lora_params = [(name, param) for name, param in actual_model.named_parameters() 
+                      if "lora_A" in name or "lora_B" in name]
+        trainable_count = sum(1 for _, param in lora_params if param.requires_grad)
+        
+        # Force trainable if needed
+        for name, param in lora_params:
+            if not param.requires_grad:
+                printer.warning(f"⚠️  LoRA parameter {name} does NOT require grad!")
+                param.requires_grad = True
+        
+        # Check optimizer inclusion
+        optimizer_param_ids = set(id(p) for group in optimizer.param_groups for p in group['params'])
+        in_optimizer = sum(1 for _, param in lora_params if id(param) in optimizer_param_ids)
+        
+        printer.info(f"LoRA parameters: {trainable_count}/{len(lora_params)} trainable, {in_optimizer}/{len(lora_params)} in optimizer")
+        
+        if trainable_count == 0:
+            printer.error("❌ NO LoRA parameters are trainable! This will cause gradient errors.")
+        elif in_optimizer == 0:
+            printer.error("❌ NO LoRA parameters in optimizer! This will cause gradient errors.")
+        else:
+            printer.info("✅ LoRA parameters correctly configured")
+            
+        printer.info("=== END LORA RE-CONFIRMATION ===")
+    
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
             if log_writer is not None:
@@ -255,10 +376,64 @@ def train(args):
             fname=fname,
             best_so_far=best_so_far,
         )
+        
+        # Save LoRA weights separately if model has LoRA
+        actual_model = accelerator.unwrap_model(model)
+        if hasattr(actual_model, 'config') and hasattr(actual_model.config, 'enable_lora') and actual_model.config.enable_lora:
+            lora_path = os.path.join(args.output_dir, f"lora_weights_{fname}.pth")
+            lora_state_dict = get_lora_state_dict(actual_model)
+            if lora_state_dict and accelerator.is_main_process:
+                torch.save(lora_state_dict, lora_path)
+                total_params = sum(w.numel() for w in lora_state_dict.values())
+                printer.info(f"Saved LoRA weights to {lora_path} ({total_params:,} parameters)")
+            elif accelerator.is_main_process:
+                printer.warning(f"⚠️  No LoRA weights to save for checkpoint {fname}!")
 
-    best_so_far = misc.load_model(
-        args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
-    )
+    # Load checkpoints (handles both regular and LoRA training)
+    if args.resume:
+        # For LoRA training, we need to load LoRA weights from checkpoint
+        actual_model = accelerator.unwrap_model(model)
+        if hasattr(actual_model, '_lora_config') and actual_model._lora_config is not None:
+            printer.info("=== LOADING LORA CHECKPOINT ===")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load LoRA weights if they exist in checkpoint
+            if 'lora_weights' in checkpoint:
+                from lora_utils import load_lora_state_dict
+                load_lora_state_dict(actual_model, checkpoint['lora_weights'])
+                printer.info("Successfully loaded LoRA weights from checkpoint")
+            else:
+                printer.warning("No LoRA weights found in checkpoint!")
+            
+            # Load optimizer state (skip if parameter groups don't match)
+            if 'optimizer' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    printer.info("Loaded optimizer state")
+                except Exception as e:
+                    printer.warning(f"Failed to load optimizer state: {e}")
+                    printer.warning("Continuing with fresh optimizer state...")
+            
+            # Load other training state
+            if 'epoch' in checkpoint:
+                args.start_epoch = checkpoint['epoch'] + 1
+                printer.info(f"Resuming from epoch {args.start_epoch}")
+            
+            # Load best_so_far
+            best_so_far = checkpoint.get('best_so_far', float('inf'))
+            printer.info(f"Best loss so far: {best_so_far}")
+            
+            printer.info("=== END LORA CHECKPOINT LOADING ===")
+        else:
+            # Standard checkpoint loading
+            best_so_far = misc.load_model(
+                args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
+            )
+    else:
+        best_so_far = misc.load_model(
+            args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
+        )
+    
     if best_so_far is None:
         best_so_far = float("inf")
     log_writer = (
@@ -335,20 +510,49 @@ def train(args):
 
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
     output_dir = Path(args.output_dir)
+    actual_model = accelerator.unwrap_model(model_without_ddp)
+    
+    # Check if this is LoRA training
+    is_lora_training = getattr(getattr(actual_model, 'config', None), 'enable_lora', False)
+    lora_param_count = sum(1 for name, _ in actual_model.named_parameters() if 'lora_A' in name or 'lora_B' in name)
+    lora_state_dict = get_lora_state_dict(actual_model)
+    
+    printer.info(f"=== SAVE FINAL MODEL ===")
+    printer.info(f"LoRA training: {is_lora_training}, LoRA params: {lora_param_count}, LoRA weights: {len(lora_state_dict) if lora_state_dict else 0}")
+    
     checkpoint_path = output_dir / "checkpoint-final.pth"
-    to_save = {
-        "args": args,
-        "model": (
-            model_without_ddp
-            if isinstance(model_without_ddp, dict)
-            else model_without_ddp.cpu().state_dict()
-        ),
-        "epoch": epoch,
-    }
-    if best_so_far is not None:
-        to_save["best_so_far"] = best_so_far
-    printer.info(f">> Saving model to {checkpoint_path} ...")
-    misc.save_on_master(accelerator, to_save, checkpoint_path)
+    
+    if is_lora_training or lora_param_count > 0:
+        # Save LoRA checkpoint
+        to_save = {
+            "args": args,
+            "lora_weights": lora_state_dict,
+            "epoch": epoch,
+            "model_config": getattr(actual_model, 'config', None),
+        }
+        if best_so_far is not None:
+            to_save["best_so_far"] = best_so_far
+        
+        printer.info(f">> Saving LoRA checkpoint to {checkpoint_path} ...")
+        misc.save_on_master(accelerator, to_save, checkpoint_path)
+        
+        # Save standalone LoRA weights
+        if lora_state_dict and accelerator.is_main_process:
+            lora_path = output_dir / "lora_weights_final.pth"
+            torch.save(lora_state_dict, lora_path)
+            total_params = sum(w.numel() for w in lora_state_dict.values())
+            printer.info(f"✅ Saved LoRA weights: {len(lora_state_dict)} tensors, {total_params:,} params")
+    else:
+        # Save standard model
+        to_save = {
+            "args": args,
+            "model": actual_model.cpu().state_dict() if not isinstance(actual_model, dict) else actual_model,
+            "epoch": epoch,
+        }
+        if best_so_far is not None:
+            to_save["best_so_far"] = best_so_far
+        printer.info(f">> Saving model to {checkpoint_path} ...")
+        misc.save_on_master(accelerator, to_save, checkpoint_path)
 
 
 def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
@@ -397,6 +601,18 @@ def train_one_epoch(
             fname=fname,
             best_so_far=best_so_far,
         )
+        
+        # Save LoRA weights separately if model has LoRA
+        actual_model = accelerator.unwrap_model(model)
+        if hasattr(actual_model, 'config') and hasattr(actual_model.config, 'enable_lora') and actual_model.config.enable_lora:
+            lora_path = os.path.join(args.output_dir, f"lora_weights_{fname}.pth")
+            lora_state_dict = get_lora_state_dict(actual_model)
+            if lora_state_dict and accelerator.is_main_process:
+                torch.save(lora_state_dict, lora_path)
+                total_params = sum(w.numel() for w in lora_state_dict.values())
+                printer.info(f"Saved LoRA weights to {lora_path} ({total_params:,} parameters)")
+            elif accelerator.is_main_process:
+                printer.warning(f"⚠️  No LoRA weights to save for checkpoint {fname}!")
 
     if log_writer is not None:
         printer.info("log_dir: {}".format(log_writer.log_dir))
@@ -626,16 +842,33 @@ def test_one_epoch(
             loss_details[f"pred_depth_{k+1}"] = depths_cross[k].detach().cpu()
             loss_details[f"gt_depth_{k+1}"] = gt_depths_cross[k].detach().cpu()
 
-        imgs_stacked_dict = get_vis_imgs_new(
-            loss_details,
-            args.num_imgs_vis,
-            args.num_test_views,
-            is_metric=batch[0]["is_metric"],
-        )
-        for name, imgs_stacked in imgs_stacked_dict.items():
-            log_writer.add_images(
-                prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
+        # Check if we have the required visualization data before attempting to create images
+        # During test phase, some visualization keys might be missing
+        required_keys_exist = True
+        missing_keys = []
+        for i in range(args.num_test_views):
+            required_keys = [f"gt_img{i+1}", f"img_mask_{i+1}", f"ray_mask_{i+1}"]
+            for key in required_keys:
+                if key not in loss_details:
+                    required_keys_exist = False
+                    missing_keys.append(key)
+        
+        if not required_keys_exist:
+            printer.info(f"Skipping test visualization for {prefix} - missing keys: {missing_keys}")
+        
+        if required_keys_exist:
+            imgs_stacked_dict = get_vis_imgs_new(
+                loss_details,
+                args.num_imgs_vis,
+                args.num_test_views,
+                is_metric=batch[0]["is_metric"],
             )
+            for name, imgs_stacked in imgs_stacked_dict.items():
+                log_writer.add_images(
+                    prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
+                )
+        else:
+            printer.info(f"Skipping test visualization for {prefix} - missing required keys in loss_details")
 
     del loss_details, loss_value, batch
     torch.cuda.empty_cache()
@@ -653,17 +886,36 @@ def gen_mask_indicator(img_mask_list, ray_mask_list, num_views, h, w):
     output = []
     for img_mask, ray_mask in zip(img_mask_list, ray_mask_list):
         out = torch.zeros((h, w * num_views, 3))
-        for i in range(num_views):
-            if img_mask[i] and not ray_mask[i]:
-                offset = 0
-            elif not img_mask[i] and ray_mask[i]:
-                offset = 1
-            else:
-                offset = 0.5
-            out[:, i * w : (i + 1) * w] += offset
+        
+        # Check if masks have sufficient elements
+        if img_mask.numel() == 0 or ray_mask.numel() == 0:
+            # If masks are empty, fill with default offset
+            out += 0.5
+        else:
+            # Ensure we don't access beyond tensor bounds
+            actual_views = min(num_views, len(img_mask), len(ray_mask))
+            for i in range(actual_views):
+                if img_mask[i] and not ray_mask[i]:
+                    offset = 0
+                elif not img_mask[i] and ray_mask[i]:
+                    offset = 1
+                else:
+                    offset = 0.5
+                out[:, i * w : (i + 1) * w] += offset
+            
+            # Fill remaining views with default offset if needed
+            for i in range(actual_views, num_views):
+                out[:, i * w : (i + 1) * w] += 0.5
+        
         output.append(out)
     return output
 
+
+def safe_quantile(tensor, quantile_val, fallback=0.0):
+    """Safely compute quantile, returning fallback if tensor is empty"""
+    if tensor.numel() == 0:
+        return fallback
+    return torch.quantile(tensor, quantile_val).item()
 
 def vis_and_cat(
     gt_imgs,
@@ -677,76 +929,124 @@ def vis_and_cat(
     ray_indicator,
     is_metric,
 ):
-    cross_depth_gt_min = torch.quantile(cross_gt_depths, 0.01).item()
-    cross_depth_gt_max = torch.quantile(cross_gt_depths, 0.99).item()
-    cross_depth_pred_min = torch.quantile(cross_pred_depths, 0.01).item()
-    cross_depth_pred_max = torch.quantile(cross_pred_depths, 0.99).item()
+    # Safe quantile operations for cross depths
+    cross_depth_gt_min = safe_quantile(cross_gt_depths, 0.01, 0.0)
+    cross_depth_gt_max = safe_quantile(cross_gt_depths, 0.99, 1.0)
+    cross_depth_pred_min = safe_quantile(cross_pred_depths, 0.01, 0.0)
+    cross_depth_pred_max = safe_quantile(cross_pred_depths, 0.99, 1.0)
     cross_depth_min = min(cross_depth_gt_min, cross_depth_pred_min)
     cross_depth_max = max(cross_depth_gt_max, cross_depth_pred_max)
 
-    cross_gt_depths_vis = colorize(
-        cross_gt_depths,
-        range=(
-            (cross_depth_min, cross_depth_max)
-            if is_metric
-            else (cross_depth_gt_min, cross_depth_gt_max)
-        ),
-        append_cbar=True,
-    )
-    cross_pred_depths_vis = colorize(
-        cross_pred_depths,
-        range=(
-            (cross_depth_min, cross_depth_max)
-            if is_metric
-            else (cross_depth_pred_min, cross_depth_pred_max)
-        ),
-        append_cbar=True,
-    )
+    # Handle empty tensors for cross depths
+    if cross_gt_depths.numel() == 0:
+        # Create a dummy tensor for visualization
+        cross_gt_depths_vis = torch.zeros((256, 512, 3))  # Default size
+    else:
+        cross_gt_depths_vis = colorize(
+            cross_gt_depths,
+            range=(
+                (cross_depth_min, cross_depth_max)
+                if is_metric
+                else (cross_depth_gt_min, cross_depth_gt_max)
+            ),
+            append_cbar=True,
+        )
+    
+    if cross_pred_depths.numel() == 0:
+        # Create a dummy tensor for visualization
+        cross_pred_depths_vis = torch.zeros((256, 512, 3))  # Default size
+    else:
+        cross_pred_depths_vis = colorize(
+            cross_pred_depths,
+            range=(
+                (cross_depth_min, cross_depth_max)
+                if is_metric
+                else (cross_depth_pred_min, cross_depth_pred_max)
+            ),
+            append_cbar=True,
+        )
 
-    self_depth_gt_min = torch.quantile(self_gt_depths, 0.01).item()
-    self_depth_gt_max = torch.quantile(self_gt_depths, 0.99).item()
-    self_depth_pred_min = torch.quantile(self_pred_depths, 0.01).item()
-    self_depth_pred_max = torch.quantile(self_pred_depths, 0.99).item()
+    # Safe quantile operations for self depths
+    self_depth_gt_min = safe_quantile(self_gt_depths, 0.01, 0.0)
+    self_depth_gt_max = safe_quantile(self_gt_depths, 0.99, 1.0)
+    self_depth_pred_min = safe_quantile(self_pred_depths, 0.01, 0.0)
+    self_depth_pred_max = safe_quantile(self_pred_depths, 0.99, 1.0)
     self_depth_min = min(self_depth_gt_min, self_depth_pred_min)
     self_depth_max = max(self_depth_gt_max, self_depth_pred_max)
 
-    self_gt_depths_vis = colorize(
-        self_gt_depths,
-        range=(
-            (self_depth_min, self_depth_max)
-            if is_metric
-            else (self_depth_gt_min, self_depth_gt_max)
-        ),
-        append_cbar=True,
-    )
-    self_pred_depths_vis = colorize(
-        self_pred_depths,
-        range=(
-            (self_depth_min, self_depth_max)
-            if is_metric
-            else (self_depth_pred_min, self_depth_pred_max)
-        ),
-        append_cbar=True,
-    )
-    if len(cross_conf) > 0:
-        cross_conf_vis = colorize(cross_conf, append_cbar=True)
-    if len(self_conf) > 0:
-        self_conf_vis = colorize(self_conf, append_cbar=True)
-    gt_imgs_vis = torch.zeros_like(cross_gt_depths_vis)
-    gt_imgs_vis[: gt_imgs.shape[0], : gt_imgs.shape[1]] = gt_imgs
-    pred_imgs_vis = torch.zeros_like(cross_gt_depths_vis)
-    pred_imgs_vis[: pred_imgs.shape[0], : pred_imgs.shape[1]] = pred_imgs
-    ray_indicator_vis = torch.cat(
-        [
-            ray_indicator,
-            torch.zeros(
-                ray_indicator.shape[0],
-                cross_pred_depths_vis.shape[1] - ray_indicator.shape[1],
-                3,
+    # Handle empty tensors for self depths
+    if self_gt_depths.numel() == 0:
+        # Create a dummy tensor for visualization with same size as cross depths
+        self_gt_depths_vis = torch.zeros_like(cross_gt_depths_vis)
+    else:
+        self_gt_depths_vis = colorize(
+            self_gt_depths,
+            range=(
+                (self_depth_min, self_depth_max)
+                if is_metric
+                else (self_depth_gt_min, self_depth_gt_max)
             ),
-        ],
-        dim=1,
-    )
+            append_cbar=True,
+        )
+    
+    if self_pred_depths.numel() == 0:
+        # Create a dummy tensor for visualization with same size as cross depths
+        self_pred_depths_vis = torch.zeros_like(cross_pred_depths_vis)
+    else:
+        self_pred_depths_vis = colorize(
+            self_pred_depths,
+            range=(
+                (self_depth_min, self_depth_max)
+                if is_metric
+                else (self_depth_pred_min, self_depth_pred_max)
+            ),
+            append_cbar=True,
+        )
+    if len(cross_conf) > 0 and cross_conf.numel() > 0:
+        cross_conf_vis = colorize(cross_conf, append_cbar=True)
+    else:
+        # Create empty tensor with same shape as cross_gt_depths_vis for consistency
+        cross_conf_vis = torch.zeros_like(cross_gt_depths_vis)
+    
+    if len(self_conf) > 0 and self_conf.numel() > 0:
+        self_conf_vis = colorize(self_conf, append_cbar=True)
+    else:
+        # Create empty tensor with same shape as self_gt_depths_vis for consistency
+        self_conf_vis = torch.zeros_like(self_gt_depths_vis)
+    gt_imgs_vis = torch.zeros_like(cross_gt_depths_vis)
+    if gt_imgs.numel() > 0 and len(gt_imgs.shape) >= 2:
+        # Safely assign gt_imgs with bounds checking
+        h_min = min(gt_imgs.shape[0], gt_imgs_vis.shape[0])
+        w_min = min(gt_imgs.shape[1], gt_imgs_vis.shape[1])
+        gt_imgs_vis[:h_min, :w_min] = gt_imgs[:h_min, :w_min]
+    
+    pred_imgs_vis = torch.zeros_like(cross_gt_depths_vis)
+    if pred_imgs.numel() > 0 and len(pred_imgs.shape) >= 2:
+        # Safely assign pred_imgs with bounds checking
+        h_min = min(pred_imgs.shape[0], pred_imgs_vis.shape[0])
+        w_min = min(pred_imgs.shape[1], pred_imgs_vis.shape[1])
+        pred_imgs_vis[:h_min, :w_min] = pred_imgs[:h_min, :w_min]
+    # Handle ray_indicator safely
+    if ray_indicator.numel() > 0 and len(ray_indicator.shape) >= 2:
+        width_diff = cross_pred_depths_vis.shape[1] - ray_indicator.shape[1]
+        if width_diff > 0:
+            ray_indicator_vis = torch.cat(
+                [
+                    ray_indicator,
+                    torch.zeros(
+                        ray_indicator.shape[0],
+                        width_diff,
+                        ray_indicator.shape[2] if len(ray_indicator.shape) > 2 else 3,
+                    ),
+                ],
+                dim=1,
+            )
+        else:
+            # If ray_indicator is wider than or equal to target, just use it as is
+            ray_indicator_vis = ray_indicator[:, :cross_pred_depths_vis.shape[1]]
+    else:
+        # Create a fallback ray_indicator if the original is empty
+        ray_indicator_vis = torch.zeros_like(cross_pred_depths_vis)
     out = torch.cat(
         [
             ray_indicator_vis,
@@ -791,112 +1091,173 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
         stride = 2
     else:
         stride = 1
+    
+    # Safety check: ensure we have at least one view with required keys
+    valid_views = []
     for i in range(0, num_views, stride):
-        gt_imgs = 0.5 * (loss_details[f"gt_img{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        width = gt_imgs.shape[2]
-        pred_imgs = (
-            0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        )
-        gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
-        pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
+        required_keys = [f"gt_img{i+1}", f"gt_depth_{i+1}", f"self_gt_depth_{i+1}", 
+                        f"pred_depth_{i+1}", f"self_pred_depth_{i+1}", 
+                        f"img_mask_{i+1}", f"ray_mask_{i+1}"]
+        if all(key in loss_details for key in required_keys):
+            valid_views.append(i)
+        else:
+            missing_keys = [key for key in required_keys if key not in loss_details]
+            printer.debug(f"View {i+1} missing keys: {missing_keys}")
+    
+    printer.info(f"Found {len(valid_views)} valid views out of {len(range(0, num_views, stride))} total views")
+    
+    if not valid_views:
+        printer.warning("No valid views found for visualization - returning empty dict")
+        return ret_dict
+    
+    # Process each valid view with error handling
+    for i in valid_views:
+        try:
+            gt_imgs = 0.5 * (loss_details[f"gt_img{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
+            width = gt_imgs.shape[2]
+            # Check if RGB predictions exist, otherwise use GT images or zeros
+            if f"pred_rgb_{i+1}" in loss_details:
+                pred_imgs = (
+                    0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
+                )
+            else:
+                # Use GT images as fallback when RGB predictions are not available
+                pred_imgs = gt_imgs.clone()
+            gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
+            pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
 
-        cross_pred_depths = (
-            loss_details[f"pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
-        )
-        cross_gt_depths = (
-            loss_details[f"gt_depth_{i+1}"]
-            .to(gt_imgs.device)[:num_imgs_vis]
-            .detach()
-            .cpu()
-        )
-        cross_pred_depth_list = batch_append(
-            cross_pred_depth_list, cross_pred_depths.unbind(dim=0)
-        )
-        cross_gt_depth_list = batch_append(
-            cross_gt_depth_list, cross_gt_depths.unbind(dim=0)
-        )
-
-        self_gt_depths = (
-            loss_details[f"self_gt_depth_{i+1}"][:num_imgs_vis].detach().cpu()
-        )
-        self_pred_depths = (
-            loss_details[f"self_pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
-        )
-        self_gt_depth_list = batch_append(
-            self_gt_depth_list, self_gt_depths.unbind(dim=0)
-        )
-        self_pred_depth_list = batch_append(
-            self_pred_depth_list, self_pred_depths.unbind(dim=0)
-        )
-
-        if f"conf_{i+1}" in loss_details:
-            cross_view_conf = loss_details[f"conf_{i+1}"][:num_imgs_vis].detach().cpu()
-            cross_view_conf_list = batch_append(
-                cross_view_conf_list, cross_view_conf.unbind(dim=0)
+            cross_pred_depths = (
+                loss_details[f"pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
             )
-            cross_view_conf_exits = True
-
-        if f"self_conf_{i+1}" in loss_details:
-            self_view_conf = (
-                loss_details[f"self_conf_{i+1}"][:num_imgs_vis].detach().cpu()
+            cross_gt_depths = (
+                loss_details[f"gt_depth_{i+1}"]
+                .to(gt_imgs.device)[:num_imgs_vis]
+                .detach()
+                .cpu()
             )
-            self_view_conf_list = batch_append(
-                self_view_conf_list, self_view_conf.unbind(dim=0)
+            cross_pred_depth_list = batch_append(
+                cross_pred_depth_list, cross_pred_depths.unbind(dim=0)
             )
-            self_view_conf_exits = True
+            cross_gt_depth_list = batch_append(
+                cross_gt_depth_list, cross_gt_depths.unbind(dim=0)
+            )
 
-        img_mask_list = batch_append(
-            img_mask_list,
-            loss_details[f"img_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
-        )
-        ray_mask_list = batch_append(
-            ray_mask_list,
-            loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
-        )
+            self_gt_depths = (
+                loss_details[f"self_gt_depth_{i+1}"][:num_imgs_vis].detach().cpu()
+            )
+            self_pred_depths = (
+                loss_details[f"self_pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
+            )
+            self_gt_depth_list = batch_append(
+                self_gt_depth_list, self_gt_depths.unbind(dim=0)
+            )
+            self_pred_depth_list = batch_append(
+                self_pred_depth_list, self_pred_depths.unbind(dim=0)
+            )
+
+            if f"conf_{i+1}" in loss_details:
+                cross_view_conf = loss_details[f"conf_{i+1}"][:num_imgs_vis].detach().cpu()
+                cross_view_conf_list = batch_append(
+                    cross_view_conf_list, cross_view_conf.unbind(dim=0)
+                )
+                cross_view_conf_exits = True
+
+            if f"self_conf_{i+1}" in loss_details:
+                self_view_conf = (
+                    loss_details[f"self_conf_{i+1}"][:num_imgs_vis].detach().cpu()
+                )
+                self_view_conf_list = batch_append(
+                    self_view_conf_list, self_view_conf.unbind(dim=0)
+                )
+                self_view_conf_exits = True
+
+            img_mask_list = batch_append(
+                img_mask_list,
+                loss_details[f"img_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
+            )
+            ray_mask_list = batch_append(
+                ray_mask_list,
+                loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
+            )
+        except Exception as e:
+            printer.warning(f"Error processing view {i+1}: {e}")
+            continue
+
+    # Check if we have any data to concatenate
+    if not gt_img_list or not any(sublist for sublist in gt_img_list):
+        printer.warning("No valid image data collected - returning empty dict")
+        return ret_dict
 
     # each element in the list is [H, num_views * W, (3)], the size of the list is num_imgs_vis
-    gt_img_list = [torch.cat(sublist, dim=1) for sublist in gt_img_list]
-    pred_img_list = [torch.cat(sublist, dim=1) for sublist in pred_img_list]
+    # Safe concatenation with empty list handling
+    gt_img_list = [torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in gt_img_list]
+    pred_img_list = [torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in pred_img_list]
     cross_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in cross_pred_depth_list
+        torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in cross_pred_depth_list
     ]
-    cross_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in cross_gt_depth_list]
-    self_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in self_gt_depth_list]
+    cross_gt_depth_list = [torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in cross_gt_depth_list]
+    self_gt_depth_list = [torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in self_gt_depth_list]
     self_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in self_pred_depth_list
+        torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in self_pred_depth_list
     ]
     cross_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in cross_view_conf_list]
+        [torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in cross_view_conf_list]
         if cross_view_conf_exits
         else []
     )
     self_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in self_view_conf_list]
+        [torch.cat(sublist, dim=1) if sublist else torch.empty(0) for sublist in self_view_conf_list]
         if self_view_conf_exits
         else []
     )
     # each elment in the list is [num_views,], the size of the list is num_imgs_vis
-    img_mask_list = [torch.stack(sublist, dim=0) for sublist in img_mask_list]
-    ray_mask_list = [torch.stack(sublist, dim=0) for sublist in ray_mask_list]
+    img_mask_list = [torch.stack(sublist, dim=0) if sublist else torch.empty(0) for sublist in img_mask_list]
+    ray_mask_list = [torch.stack(sublist, dim=0) if sublist else torch.empty(0) for sublist in ray_mask_list]
 
+    # Only generate visualizations if we have actual data
+    if not gt_img_list or len(gt_img_list) == 0:
+        printer.warning("No valid image data found for visualization")
+        return ret_dict
+    
+    if gt_img_list[0].numel() == 0:
+        printer.warning("No valid image data found for visualization")
+        return ret_dict
+    
+    # Ensure we have a width value (from the last valid view)
+    if not valid_views:
+        printer.warning("No valid views processed - cannot generate visualizations")
+        return ret_dict
+    
+    # Get width from the first valid image
+    try:
+        width = gt_img_list[0].shape[2] if gt_img_list[0].numel() > 0 else 512  # fallback width
+    except (IndexError, AttributeError):
+        width = 512  # fallback width
+        printer.warning("Could not determine image width, using fallback value 512")
+    
     ray_indicator = gen_mask_indicator(
-        img_mask_list, ray_mask_list, len(img_mask_list[0]), 30, width
+        img_mask_list, ray_mask_list, len(img_mask_list[0]) if img_mask_list and img_mask_list[0].numel() > 0 else 0, 30, width
     )
 
     for i in range(num_imgs_vis):
-        out = vis_and_cat(
-            gt_img_list[i],
-            pred_img_list[i],
-            cross_gt_depth_list[i],
-            cross_pred_depth_list[i],
-            self_gt_depth_list[i],
-            self_pred_depth_list[i],
-            cross_view_conf_list[i],
-            self_view_conf_list[i],
-            ray_indicator[i],
-            is_metric[i],
-        )
-        ret_dict[f"imgs_{i}"] = out
+        if i < len(gt_img_list) and i < len(ray_indicator):
+            # Safe indexing for is_metric - use first element if index is out of bounds
+            metric_idx = min(i, len(is_metric) - 1) if len(is_metric) > 0 else 0
+            metric_value = is_metric[metric_idx] if len(is_metric) > 0 else False
+            
+            out = vis_and_cat(
+                gt_img_list[i],
+                pred_img_list[i],
+                cross_gt_depth_list[i],
+                cross_pred_depth_list[i],
+                self_gt_depth_list[i],
+                self_pred_depth_list[i],
+                cross_view_conf_list[i],
+                self_view_conf_list[i],
+                ray_indicator[i],
+                metric_value,
+            )
+            ret_dict[f"imgs_{i}"] = out
     return ret_dict
 
 

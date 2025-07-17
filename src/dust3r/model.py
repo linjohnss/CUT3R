@@ -38,6 +38,15 @@ from dust3r.blocks import (
     CustomDecoderBlock,
 )  # noqa
 
+# Import LoRA utilities
+from lora_utils import (
+    apply_lora_to_cut3r_model,
+    get_lora_state_dict,
+    load_lora_state_dict,
+    merge_lora_weights,
+    unmerge_lora_weights,
+)
+
 inf = float("inf")
 from accelerate.logging import get_logger
 
@@ -114,6 +123,12 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         rgb_head=False,
         pose_conf_head=False,
         pose_head=False,
+        # LoRA parameters
+        enable_lora=False,
+        lora_rank=16,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        lora_target_modules=None,
         **croco_kwargs,
     ):
         super().__init__()
@@ -134,6 +149,12 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.rgb_head = rgb_head
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
+        # LoRA parameters
+        self.enable_lora = enable_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_target_modules = lora_target_modules
         self.croco_kwargs = croco_kwargs
 
 
@@ -301,6 +322,15 @@ class ARCroco3DStereo(CroCoNet):
             **self.croco_args,
         )
         self.set_freeze(config.freeze)
+        
+        # Store LoRA config but don't apply yet - will be applied after loading pretrained weights
+        self._lora_config = {
+            'enable_lora': config.enable_lora,
+            'lora_rank': config.lora_rank, 
+            'lora_alpha': config.lora_alpha,
+            'lora_dropout': config.lora_dropout,
+            'lora_target_modules': config.lora_target_modules,
+        } if config.enable_lora else None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -512,6 +542,39 @@ class ARCroco3DStereo(CroCoNet):
         self.head = transpose_to_landscape(
             self.downstream_head, activate=landscape_only
         )
+    
+    def apply_lora(self, rank=16, alpha=16.0, dropout=0.0, target_modules=None):
+        """Apply LoRA to the model"""
+        apply_lora_to_cut3r_model(
+            self,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            target_modules=target_modules,
+            freeze_base_model=True,
+        )
+    
+    def save_lora_weights(self, path):
+        """Save only LoRA weights"""
+        lora_state_dict = get_lora_state_dict(self)
+        torch.save(lora_state_dict, path)
+        printer.info(f"Saved LoRA weights to {path}")
+    
+    def load_lora_weights(self, path):
+        """Load LoRA weights"""
+        lora_state_dict = torch.load(path, map_location="cpu")
+        load_lora_state_dict(self, lora_state_dict)
+        printer.info(f"Loaded LoRA weights from {path}")
+    
+    def merge_lora_weights(self):
+        """Merge LoRA weights into base model"""
+        merge_lora_weights(self)
+        printer.info("Merged LoRA weights into base model")
+    
+    def unmerge_lora_weights(self):
+        """Unmerge LoRA weights from base model"""
+        unmerge_lora_weights(self)
+        printer.info("Unmerged LoRA weights from base model")
 
     def _encode_image(self, image, true_shape):
         x, pos = self.patch_embed(image, true_shape=true_shape)
