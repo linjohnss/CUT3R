@@ -11,12 +11,14 @@ class KITTI_Multi(BaseMultiViewDataset):
     """
     KITTI dataset loader for CUT3R training.
     
-    This dataset only has camera pose supervision (camera_only=True).
+    This dataset supports both camera pose supervision and IMU data loading.
     No depth maps are available, so depthmap is set to all ones.
     """
     
-    def __init__(self, *args, ROOT, **kwargs):
+    def __init__(self, *args, ROOT, load_imu=True, scenes=None, **kwargs):
         self.ROOT = ROOT
+        self.load_imu = load_imu  # Flag to control IMU loading
+        self.scenes_filter = scenes  # Filter for specific scenes
         self.video = True  # KITTI is a video dataset
         self.is_metric = False  # Changed to False to match RE10K
         self.max_interval = 128  # Changed to match RE10K
@@ -31,10 +33,19 @@ class KITTI_Multi(BaseMultiViewDataset):
             None: Data is stored in instance variables
         """
         # Get all sequence directories
-        self.scenes = sorted([
+        all_scenes = sorted([
             d for d in os.listdir(self.ROOT) 
             if osp.isdir(osp.join(self.ROOT, d)) and d.startswith('kitti_')
         ])
+        
+        # Filter scenes if specified
+        if self.scenes_filter is not None:
+            self.scenes = [scene for scene in all_scenes if scene in self.scenes_filter]
+            if len(self.scenes) == 0:
+                raise ValueError(f"None of the specified scenes {self.scenes_filter} found in {self.ROOT}. Available scenes: {all_scenes}")
+            print(f"Filtered to scenes: {self.scenes} (from {len(all_scenes)} available)")
+        else:
+            self.scenes = all_scenes
         
         if len(self.scenes) == 0:
             raise ValueError(f"No KITTI sequences found in {self.ROOT}")
@@ -51,8 +62,16 @@ class KITTI_Multi(BaseMultiViewDataset):
             scene_dir = osp.join(self.ROOT, scene)
             rgb_dir = osp.join(scene_dir, "rgb")
             cam_dir = osp.join(scene_dir, "cam")
+            imu_dir = osp.join(scene_dir, "imu")  # IMU directory
             
-            if not osp.exists(rgb_dir) or not osp.exists(cam_dir):
+            # Check required directories
+            required_dirs = [rgb_dir, cam_dir]
+            if self.load_imu:
+                required_dirs.append(imu_dir)
+                
+            if not all(osp.exists(d) for d in required_dirs):
+                missing_dirs = [d for d in required_dirs if not osp.exists(d)]
+                print(f"Warning: Missing directories for scene {scene}: {missing_dirs}")
                 continue
             
             # Get all image files in this sequence
@@ -61,6 +80,17 @@ class KITTI_Multi(BaseMultiViewDataset):
                 if f.endswith('.png')
             ])
             
+            if len(img_files) == 0:
+                continue
+            
+            # If loading IMU, check that we have corresponding IMU files
+            if self.load_imu:
+                imu_files = [f for f in img_files if osp.exists(osp.join(imu_dir, f + ".npz"))]
+                if len(imu_files) != len(img_files):
+                    print(f"Warning: Scene {scene} has {len(img_files)} images but {len(imu_files)} IMU files")
+                    # Use only files that have both image and IMU data
+                    img_files = imu_files
+                    
             if len(img_files) == 0:
                 continue
             
@@ -79,7 +109,8 @@ class KITTI_Multi(BaseMultiViewDataset):
         self.start_img_ids = start_img_ids
         self.scene_img_list = scene_img_list
         
-        print(f"Loaded {len(self.scenes)} KITTI sequences with {len(self.start_img_ids)} total samples")
+        imu_status = "with IMU" if self.load_imu else "without IMU"
+        print(f"Loaded {len(self.scenes)} KITTI sequences {imu_status} with {len(self.start_img_ids)} total samples")
 
     def __len__(self):
         return len(self.start_img_ids)
@@ -112,6 +143,7 @@ class KITTI_Multi(BaseMultiViewDataset):
             scene_dir = osp.join(self.ROOT, self.scenes[scene_id])
             rgb_dir = osp.join(scene_dir, "rgb")
             cam_dir = osp.join(scene_dir, "cam")
+            imu_dir = osp.join(scene_dir, "imu")  # IMU directory
             
             # Get image indices for this sequence
             img_list = self.scene_img_list[scene_id]
@@ -142,6 +174,20 @@ class KITTI_Multi(BaseMultiViewDataset):
                     camera_pose = cam["pose"]  # 4x4 matrix
                     intrinsics = cam["intrinsics"]
                     
+                    # Load IMU data if requested
+                    imu_data = None
+                    if self.load_imu:
+                        imu_path = osp.join(imu_dir, basename + ".npz")
+                        if osp.exists(imu_path):
+                            imu_file = np.load(imu_path)
+                            imu_data = imu_file["imu_data"]  # Shape: (IMU_FREQ, 6)
+                        else:
+                            print(f"Warning: IMU file not found: {imu_path}")
+                            # Skip this view if IMU is required but not available
+                            views = []
+                            idx = rng.integers(0, len(self.start_img_ids))
+                            break
+                    
                     # Create dummy depthmap (all ones since we only have camera pose supervision)
                     depthmap = np.ones_like(rgb_image[..., 0], dtype=np.float32)
                     
@@ -150,26 +196,38 @@ class KITTI_Multi(BaseMultiViewDataset):
                         rgb_image, depthmap, intrinsics, resolution, rng=rng, info=view_idx
                     )
                     
-                    views.append(
-                        dict(
-                            img=rgb_image,
-                            depthmap=depthmap,
-                            camera_pose=camera_pose.astype(np.float32),  # Keep as 4x4 matrix
-                            camera_intrinsics=intrinsics,
-                            dataset="KITTI",
-                            label=self.scenes[scene_id] + "_" + basename,
-                            instance=osp.join(rgb_dir, basename + ".png"),
-                            is_metric=self.is_metric,
-                            is_video=ordered_video,
-                            quantile=np.array(0.98, dtype=np.float32),  # Changed to match RE10K
-                            img_mask=True,  # Changed to match RE10K
-                            ray_mask=False,  # Changed to match RE10K
-                            camera_only=True,  # Only camera pose supervision
-                            depth_only=False,
-                            single_view=False,
-                            reset=False,
-                        )
+                    # Note: Keep rgb_image as PIL Image - it will be converted later by transform
+                    # Only check/fix depthmap dimensions if needed
+                    if hasattr(depthmap, 'ndim') and depthmap.ndim == 3 and depthmap.shape[0] == 1:
+                        depthmap = depthmap.squeeze(0)
+                    
+                    view_dict = dict(
+                        img=rgb_image,
+                        depthmap=depthmap,
+                        camera_pose=camera_pose.astype(np.float32),  # Keep as 4x4 matrix
+                        camera_intrinsics=intrinsics,
+                        dataset="KITTI",
+                        label=self.scenes[scene_id] + "_" + basename,
+                        instance=osp.join(rgb_dir, basename + ".png"),
+                        is_metric=self.is_metric,
+                        is_video=ordered_video,
+                        quantile=np.array(0.98, dtype=np.float32),  # Changed to match RE10K
+                        img_mask=True,  # Changed to match RE10K
+                        ray_mask=False,  # Changed to match RE10K
+                        camera_only=True,  # Only camera pose supervision
+                        depth_only=False,
+                        single_view=False,
+                        reset=False,
                     )
+                    
+                    # Add IMU data to view dictionary if available
+                    if self.load_imu and imu_data is not None:
+                        # Remove batch dimension if present
+                        if hasattr(imu_data, 'ndim') and imu_data.ndim == 3 and imu_data.shape[0] == 1:
+                            imu_data = imu_data.squeeze(0)
+                        view_dict['imu'] = imu_data.astype(np.float32)
+                    
+                    views.append(view_dict)
                     
                 except Exception as e:
                     print(f"Error loading view {v} for scene {self.scenes[scene_id]}: {e}")
@@ -181,13 +239,4 @@ class KITTI_Multi(BaseMultiViewDataset):
             # 检查是否成功加载了所有视图
             if len(views) == num_views:
                 invalid_seq = False
-            else:
-                # 如果当前序列失败，尝试下一个序列
-                idx = rng.integers(0, len(self.start_img_ids))
-        
-        # 如果所有尝试都失败，返回一个默认的视图列表
-        if len(views) != num_views:
-            print(f"Warning: Failed to load {num_views} views after multiple attempts, returning empty list")
-            return []
-        
-        return views 
+        return views

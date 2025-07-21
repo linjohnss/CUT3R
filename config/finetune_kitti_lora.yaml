@@ -13,14 +13,14 @@ n_corres_test: 0
 train_criterion: ConfLoss(Regr3DPoseBatchList(L21, norm_mode='?avg_dis'))
 test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0)
 
-resolution: [(512, 384), (512, 336), (512, 288), (512, 256), (512, 208), (512, 144), (384, 512), (336, 512), (288, 512), (256, 512)]
+resolution: [(512, 384)]
 
 allow_repeat: False
-dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', aug_crop=16, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 208), (512, 144), (384, 512), (336, 512), (288, 512), (256, 512)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
+dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], aug_crop=16, resolution=[(512, 384)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
 
 
 train_dataset: 200 @ ${dataset1}
-test_dataset: 200 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+test_dataset: 200 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
 seed: 0
 batch_size: 1

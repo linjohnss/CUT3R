@@ -5,8 +5,9 @@ Preprocess the KITTI dataset for CUT3R training.
 This script processes KITTI sequences by:
   - Loading camera intrinsics from calib.txt
   - Loading camera poses from poses/*.txt
+  - Loading IMU data from imus/*.mat files
   - Copying RGB images from image_2/
-  - Saving the processed images and camera metadata in the format expected by CUT3R
+  - Saving the processed images, camera metadata, and IMU data in the format expected by CUT3R
 
 Usage:
   python preprocess_kitti.py --data_dir /project2/larg3r/VIFT/data/kitti_data \
@@ -21,6 +22,10 @@ import cv2
 import shutil
 from tqdm import tqdm
 from glob import glob
+import scipy.io as sio
+
+# IMU frequency for KITTI dataset (10Hz)
+IMU_FREQ = 10
 
 
 def parse_calib_file(calib_path):
@@ -81,6 +86,84 @@ def parse_poses_file(poses_path):
     return poses
 
 
+def load_imu_data(imu_path):
+    """
+    Load IMU data from .mat file.
+    
+    Args:
+        imu_path: Path to IMU .mat file
+        
+    Returns:
+        numpy.ndarray: IMU data array with shape (N, 6) [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+        None: If file doesn't exist or can't be loaded
+    """
+    if not osp.exists(imu_path):
+        print(f"Warning: IMU file {imu_path} not found")
+        return None
+        
+    try:
+        mat_data = sio.loadmat(imu_path)
+        # Extract IMU data - assuming the key is 'imu_data_interp' as in VIFT
+        if 'imu_data_interp' in mat_data:
+            imu_data = mat_data['imu_data_interp']
+        elif 'imu_data' in mat_data:
+            imu_data = mat_data['imu_data']
+        else:
+            # Try to find the first non-metadata key
+            keys = [k for k in mat_data.keys() if not k.startswith('__')]
+            if keys:
+                imu_data = mat_data[keys[0]]
+                print(f"Using IMU data key: {keys[0]}")
+            else:
+                print(f"Warning: No valid IMU data found in {imu_path}")
+                return None
+        
+        return imu_data.astype(np.float32)
+        
+    except Exception as e:
+        print(f"Error loading IMU data from {imu_path}: {e}")
+        return None
+
+
+def align_imu_with_images(imu_data, num_images):
+    """
+    Align IMU data with image timestamps based on VIFT's approach.
+    
+    Args:
+        imu_data: IMU data array with shape (N, 6)
+        num_images: Number of images in the sequence
+        
+    Returns:
+        list: List of IMU segments, each corresponding to one image
+    """
+    if imu_data is None:
+        return None
+        
+    imu_segments = []
+    
+    for i in range(num_images):
+        # Calculate IMU segment for this image based on VIFT's method
+        # Each image gets IMU_FREQ samples (10Hz IMU for 1Hz images)
+        start_idx = i * IMU_FREQ
+        end_idx = start_idx + IMU_FREQ
+        
+        # Handle boundary cases
+        if end_idx > len(imu_data):
+            # If we don't have enough IMU data, pad with last available sample
+            segment = imu_data[start_idx:]
+            if len(segment) < IMU_FREQ:
+                # Pad with the last sample
+                last_sample = segment[-1] if len(segment) > 0 else np.zeros(imu_data.shape[1])
+                padding = np.tile(last_sample, (IMU_FREQ - len(segment), 1))
+                segment = np.vstack([segment, padding])
+        else:
+            segment = imu_data[start_idx:end_idx]
+            
+        imu_segments.append(segment)
+    
+    return imu_segments
+
+
 def process_sequence(seq_id, data_dir, output_dir):
     """
     Process a single KITTI sequence.
@@ -98,14 +181,17 @@ def process_sequence(seq_id, data_dir, output_dir):
     poses_path = osp.join(data_dir, 'poses', f'{seq_id}.txt')
     calib_path = osp.join(seq_dir, 'calib.txt')
     image_dir = osp.join(seq_dir, 'image_2')  # Left camera
+    imu_path = osp.join(data_dir, 'imus', f'{seq_id}.mat')  # IMU data
     
     # Create output directories
     output_seq_dir = osp.join(output_dir, f'kitti_{seq_id}')
     output_rgb_dir = osp.join(output_seq_dir, 'rgb')
     output_cam_dir = osp.join(output_seq_dir, 'cam')
+    output_imu_dir = osp.join(output_seq_dir, 'imu')  # New IMU directory
     
     os.makedirs(output_rgb_dir, exist_ok=True)
     os.makedirs(output_cam_dir, exist_ok=True)
+    os.makedirs(output_imu_dir, exist_ok=True)
     
     # Check if files exist
     if not osp.exists(poses_path):
@@ -120,9 +206,10 @@ def process_sequence(seq_id, data_dir, output_dir):
         print(f"Warning: Image directory {image_dir} not found, skipping sequence {seq_id}")
         return 0
     
-    # Load calibration and poses
+    # Load calibration, poses, and IMU data
     calib_data = parse_calib_file(calib_path)
     poses = parse_poses_file(poses_path)
+    imu_data = load_imu_data(imu_path)  # Load IMU data
     
     # Use P2 (left camera) intrinsics
     if 'P2' not in calib_data:
@@ -148,6 +235,14 @@ def process_sequence(seq_id, data_dir, output_dir):
         # Truncate poses to match images
         poses = poses[:len(image_files)]
     
+    # Align IMU data with images
+    imu_segments = None
+    if imu_data is not None:
+        imu_segments = align_imu_with_images(imu_data, len(image_files))
+        print(f"Loaded IMU data with shape {imu_data.shape}, aligned to {len(image_files)} images")
+    else:
+        print(f"Warning: No IMU data available for sequence {seq_id}")
+    
     processed_count = 0
     
     # Process each frame
@@ -159,9 +254,10 @@ def process_sequence(seq_id, data_dir, output_dir):
             # Output paths
             out_img_path = osp.join(output_rgb_dir, f'{basename}.png')
             out_cam_path = osp.join(output_cam_dir, f'{basename}.npz')
+            out_imu_path = osp.join(output_imu_dir, f'{basename}.npz')
             
             # Skip if already processed
-            if osp.exists(out_cam_path):
+            if osp.exists(out_cam_path) and (imu_segments is None or osp.exists(out_imu_path)):
                 processed_count += 1
                 continue
             
@@ -172,6 +268,12 @@ def process_sequence(seq_id, data_dir, output_dir):
             np.savez(out_cam_path, 
                     intrinsics=intrinsics, 
                     pose=pose)
+            
+            # Save IMU data if available
+            if imu_segments is not None and i < len(imu_segments):
+                np.savez(out_imu_path, 
+                        imu_data=imu_segments[i],
+                        timestamp=i)  # Simple timestamp based on frame index
             
             processed_count += 1
             
@@ -202,7 +304,7 @@ def main():
     parser.add_argument(
         "--sequences",
         type=str,
-        default="00,01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21",
+        default="00,01,02,04,06,08,09",
         help="Comma-separated list of sequence IDs to process"
     )
     args = parser.parse_args()
@@ -210,8 +312,13 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Parse sequence IDs
-    seq_ids = [seq.strip() for seq in args.sequences.split(',')]
+    # Only allow available data
+    availdata = ['00', '01', '02', '04', '06', '08', '09']
+    seq_ids = [seq.strip() for seq in args.sequences.split(',') if seq.strip() in availdata]
+    if not seq_ids:
+        print(f"No valid sequences to process. Available: {availdata}")
+        return
+    print(f"Processing sequences: {seq_ids}")
     
     total_processed = 0
     

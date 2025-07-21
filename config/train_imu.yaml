@@ -1,0 +1,110 @@
+# IMU-Enhanced CUT3R Training Configuration
+# Based on finetune_kitti_lora.yaml with additional IMU encoder training
+
+# Training mode configuration (NEW - flexible training options)
+training_mode:
+  enable_lora: false         # Disable LoRA training  
+  enable_imu: true           # Enable IMU training
+  freeze_cut3r: true         # Freeze CUT3R base model (only train IMU components)
+  
+# For other training modes, you can use:
+# 
+# Train ONLY LoRA (no IMU):
+# training_mode:
+#   enable_lora: true
+#   enable_imu: false
+#   freeze_cut3r: true
+#
+# Train both LoRA and IMU:
+# training_mode:
+#   enable_lora: true
+#   enable_imu: true  
+#   freeze_cut3r: true
+#
+# Full model training (no freezing):
+# training_mode:
+#   enable_lora: false
+#   enable_imu: false
+#   freeze_cut3r: false
+
+# Base CUT3R model (modified for IMU-only training)
+model: "ARCroco3DStereo(ARCroco3DStereoConfig(freeze='none', state_size=768, state_pe='2d', pos_embed='RoPE100', rgb_head=True, pose_head=True, patch_embed_cls='ManyAR_PatchEmbed', img_size=(512, 512), head_type='dpt', output_mode='pts3d+pose', depth_mode=('exp', -inf, inf), conf_mode=('exp', 1, inf), pose_mode=('exp', -inf, inf), enc_embed_dim=1024, enc_depth=24, enc_num_heads=16, dec_embed_dim=768, dec_depth=12, dec_num_heads=12, landscape_only=False, enable_lora=False, lora_rank=16, lora_alpha=16.0, lora_dropout=0.0, lora_target_modules=None))"
+
+# Pretrained model path
+pretrained: cut3r_512_dpt_4_64.pth
+load_only_encoder: False
+
+# Training configuration
+long_context: True
+fixed_length: False
+resume: null
+benchmark: False
+
+# Data configuration (same as finetune_kitti_lora.yaml)
+num_views: 8  # Reduced from 32 for IMU training
+num_test_views: 4
+n_corres_train: 0
+n_corres_test: 0
+
+train_criterion: ConfLoss(Regr3DPoseBatchList(L21, norm_mode='?avg_dis'))
+test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0)
+
+resolution: [(512, 384)]
+
+allow_repeat: False
+dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_01'], load_imu=${training_mode.enable_imu}, aug_crop=16, resolution=[(512, 384)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
+
+
+train_dataset: 200 @ ${dataset1}
+test_dataset: 200 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_01'], load_imu=${training_mode.enable_imu}, resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+
+seed: 0
+batch_size: 1
+accum_iter: 4
+gradient_checkpointing: False
+epochs: 10
+start_epoch: 0
+weight_decay: 0.05
+lr: 1e-6
+min_lr: 1e-7
+warmup_epochs: 0.5
+amp: 1
+
+num_workers: 2
+world_size: 2
+local-rank: -1
+dist_url: 'env://'
+rank: 0
+gpu: 0
+distributed: True
+dist_backend: 'nccl'
+
+eval_freq: 1
+save_freq: 1
+keep_freq: 1
+print_freq: 10
+print_img_freq: 50000000
+num_imgs_vis: 4
+save_dir: 'checkpoints'
+exp_name: 'cut3r_imu_only'  # Updated name to reflect IMU-only training
+task: 'cut3r_imu'
+logdir: ./${save_dir}/${exp_name}/logs
+output_dir: ./${save_dir}/${exp_name}/
+
+# LoRA specific parameters - decoder attention only
+lora_rank: 16
+lora_alpha: 16.0
+lora_dropout: 0.0
+lora_target_modules: null  # Use default targets
+
+# IMU-specific configuration (NEW - for IMU encoder training)
+imu_config:
+  input_dim: 6              # IMU 6-axis (acc + gyro)
+  seq_len: 10               # IMU sequence length per frame
+  dropout: 0.1              # IMU encoder dropout
+
+# Hydra configuration
+hydra:
+  verbose: True
+  run:
+    dir: ./${save_dir}/${exp_name}

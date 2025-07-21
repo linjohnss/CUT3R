@@ -996,6 +996,87 @@ class Regr3DPoseBatchList(Regr3DPose):
         single_view = gts[0]["single_view"]
         is_metric = gts[0]["is_metric"]
 
+        # 如果只有 pose label（camera_only 全为 True），只计算 pose_loss
+        if isinstance(camera_only, bool):
+            all_camera_only = camera_only
+        elif hasattr(camera_only, 'all'):
+            all_camera_only = camera_only.all()
+        else:
+            all_camera_only = bool(np.all(camera_only))
+
+        if all_camera_only:
+            # 计算 transform_loss：将 self point cloud 通过预测的 camera pose 转换到 world 坐标
+            details = {}
+            pose_loss = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
+            details["pose_loss"] = pose_loss
+            
+            # 计算 transform_loss
+            from dust3r.utils.geometry import geotrf
+            from dust3r.utils.camera import pose_encoding_to_camera
+            
+            alpha = 1.0  # ConfLoss 的 alpha 参数
+            transform_losses = []
+            for i in range(len(preds)):
+                # 获取预测的相机位姿 (B, 7) -> (B, 4, 4)
+                pred_pose_7d = preds[i]["camera_pose"]  # (B, 7)
+                pred_pose_4x4 = pose_encoding_to_camera(pred_pose_7d)  # (B, 4, 4)
+                
+                # 获取 self point cloud 和置信度
+                pred_pts_self_i = pred_pts_self[i]  # (B, H, W, 3)
+                conf_self = preds[i]["conf_self"]  # (B, H, W)
+                
+                # 将 self point cloud 转换到 world 坐标
+                pred_pts_world = geotrf(pred_pose_4x4, pred_pts_self_i)  # (B, H, W, 3)
+                
+                # 获取 GT world point cloud
+                gt_pts_world = gts[i]["pts3d"]  # (B, H, W, 3)
+                
+                # 获取有效 mask
+                valid_mask = masks[i]  # (B, H, W)
+                
+                # 计算有效像素的损失 - 使用尺度不变损失
+                if valid_mask.sum() > 0:
+                    # 使用 ScaleInvLoss 的逻辑进行归一化
+                    # 计算预测点云的归一化因子
+                    pred_norm_factor = (torch.norm(pred_pts_world, dim=-1) * valid_mask).sum(dim=(1, 2)) / valid_mask.sum(dim=(1, 2)).clamp(min=1e-6)
+                    # 计算 GT 点云的归一化因子
+                    gt_norm_factor = (torch.norm(gt_pts_world, dim=-1) * valid_mask).sum(dim=(1, 2)) / valid_mask.sum(dim=(1, 2)).clamp(min=1e-6)
+                    
+                    # 归一化点云
+                    pred_pts_world_norm = pred_pts_world / pred_norm_factor.view(-1, 1, 1, 1).clamp(min=1e-6)
+                    gt_pts_world_norm = gt_pts_world / gt_norm_factor.view(-1, 1, 1, 1).clamp(min=1e-6)
+                    
+                    # 计算归一化后的点云差异
+                    pred_valid = pred_pts_world_norm[valid_mask]  # (N, 3)
+                    gt_valid = gt_pts_world_norm[valid_mask]  # (N, 3)
+                    conf_valid = conf_self[valid_mask]  # (N,)
+                    
+                    # 计算 L2 距离（更适合 3D 几何）
+                    point_distances = torch.norm(pred_valid - gt_valid, dim=-1)  # (N,)
+                    
+                    # 置信度加权 - 使用与 ConfLoss 一致的公式
+                    conf_log = torch.log(conf_valid).clip(-10, 10)  # 防止数值不稳定
+                    weighted_loss = point_distances * conf_valid - alpha * conf_log
+                    transform_loss = weighted_loss.mean()
+                else:
+                    transform_loss = torch.tensor(0.0, device=pred_pts_self_i.device)
+                
+                transform_losses.append(transform_loss)
+                details[f"transform_loss/{i+1}"] = float(transform_loss)
+                details[f"transform_conf_{i+1}"] = conf_self.detach()
+            
+            # 计算平均 transform loss
+            if len(transform_losses) > 0:
+                avg_transform_loss = sum(transform_losses) / len(transform_losses)
+                details["avg_transform_loss"] = float(avg_transform_loss)
+                
+                # 总损失 = pose_loss + transform_loss
+                total_loss = pose_loss + avg_transform_loss
+            else:
+                total_loss = pose_loss
+            
+            return total_loss, details
+
         # self view loss and details
         if "Quantile" in self.criterion.__class__.__name__:
             raise NotImplementedError
@@ -1044,8 +1125,8 @@ class Regr3DPoseBatchList(Regr3DPose):
         details = {}
         for i in range(len(ls_self)):
             details[self_name + f"_self_pts3d/{i+1}"] = float(ls_self[i].mean())
-            details[f"self_conf_{i+1}"] = preds[i]["conf_self"].detach()
             details[f"gt_img{i+1}"] = gts[i]["img"].permute(0, 2, 3, 1).detach()
+            details[f"self_conf_{i+1}"] = preds[i]["conf_self"].detach()
             details[f"valid_mask_{i+1}"] = masks[i].detach()
 
             if "img_mask" in gts[i] and "ray_mask" in gts[i]:
@@ -1055,48 +1136,45 @@ class Regr3DPoseBatchList(Regr3DPose):
             if "desc" in preds[i]:
                 details[f"desc_{i+1}"] = preds[i]["desc"].detach()
 
-        if "Quantile" in self.criterion.__class__.__name__:
-            # quantile masks have already been determined by self view losses, here pass in None as quantile
-            raise NotImplementedError
+        # cross view loss and details
+        # 检查是否有非 camera_only 的数据
+        if not any(~camera_only):
+            # 如果所有数据都是 camera_only=True，跳过 cross-view 损失计算
+            ls_cross = []
+            masks_cross = []
         else:
-            # 检查是否有非 camera_only 的数据
-            if not any(~camera_only):
-                # 如果所有数据都是 camera_only=True，跳过 cross-view 损失计算
-                ls_cross = []
-                masks_cross = []
-            else:
-                gt_pts_cross_b = torch.unbind(
-                    torch.stack(gt_pts_cross, dim=1)[~camera_only], dim=0
-                )
-                pred_pts_cross_b = torch.unbind(
-                    torch.stack(pred_pts_cross, dim=1)[~camera_only], dim=0
-                )
-                masks_cross_b = torch.unbind(torch.stack(masks, dim=1)[~camera_only], dim=0)
-                ls_cross_b = []
-                for i in range(len(gt_pts_cross_b)):
-                    if depth_only[~camera_only][i]:
-                        ls_cross_b.append(
-                            self.depth_only_criterion(
-                                pred_pts_cross_b[i][..., -1],
-                                gt_pts_cross_b[i][..., -1],
-                                masks_cross_b[i],
-                            )
+            gt_pts_cross_b = torch.unbind(
+                torch.stack(gt_pts_cross, dim=1)[~camera_only], dim=0
+            )
+            pred_pts_cross_b = torch.unbind(
+                torch.stack(pred_pts_cross, dim=1)[~camera_only], dim=0
+            )
+            masks_cross_b = torch.unbind(torch.stack(masks, dim=1)[~camera_only], dim=0)
+            ls_cross_b = []
+            for i in range(len(gt_pts_cross_b)):
+                if depth_only[~camera_only][i]:
+                    ls_cross_b.append(
+                        self.depth_only_criterion(
+                            pred_pts_cross_b[i][..., -1],
+                            gt_pts_cross_b[i][..., -1],
+                            masks_cross_b[i],
                         )
-                    elif single_view[~camera_only][i] and not is_metric[~camera_only][i]:
-                        ls_cross_b.append(
-                            self.single_view_criterion(
-                                pred_pts_cross_b[i], gt_pts_cross_b[i], masks_cross_b[i]
-                            )
+                    )
+                elif single_view[~camera_only][i] and not is_metric[~camera_only][i]:
+                    ls_cross_b.append(
+                        self.single_view_criterion(
+                            pred_pts_cross_b[i], gt_pts_cross_b[i], masks_cross_b[i]
                         )
-                    else:
-                        ls_cross_b.append(
-                            self.criterion(
-                                pred_pts_cross_b[i][masks_cross_b[i]],
-                                gt_pts_cross_b[i][masks_cross_b[i]],
-                            )
+                    )
+                else:
+                    ls_cross_b.append(
+                        self.criterion(
+                            pred_pts_cross_b[i][masks_cross_b[i]],
+                            gt_pts_cross_b[i][masks_cross_b[i]],
                         )
-                ls_cross = self.reorg(ls_cross_b, masks_cross_b)
-                masks_cross = [mask[~camera_only] for mask in masks]
+                    )
+            ls_cross = self.reorg(ls_cross_b, masks_cross_b)
+            masks_cross = [mask[~camera_only] for mask in masks]
 
         if self.sky_loss_value > 0:
             assert (
@@ -1168,6 +1246,12 @@ class ConfLoss(MultiLoss):
     def compute_loss(self, gts, preds, **kw):
         # compute per-pixel loss
         losses_and_masks, details = self.pixel_loss(gts, preds, **kw)
+        
+        # 检查是否只有 pose_loss（当 camera_only=True 时）
+        if isinstance(losses_and_masks, torch.Tensor) and losses_and_masks.dim() == 0:
+            # 只有 pose_loss，直接返回
+            return losses_and_masks, details
+        
         if "is_self" in details and "img_ids" in details:
             is_self = details["is_self"]
             img_ids = details["img_ids"]
