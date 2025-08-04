@@ -127,6 +127,13 @@ def loss_of_one_batch_tbptt(
         init_mem = init_mem.detach()
 
         for chunk_id in range((len(batch) - 1) // chunk_size + 1):
+            # TBPTT: detach recurrent state if present (both model and unwrap_model(model))
+            for m in [model, accelerator.unwrap_model(model)]:
+                if hasattr(m, 'prev_pose_token') and m.prev_pose_token is not None:
+                    m.prev_pose_token = m.prev_pose_token.detach()
+                if hasattr(m, 'feat_i_prev') and m.feat_i_prev is not None:
+                    m.feat_i_prev = m.feat_i_prev.detach()
+
             preds = []
             chunk = []
             state_feat = state_feat.detach()

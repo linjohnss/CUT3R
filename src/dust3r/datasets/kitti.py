@@ -20,7 +20,7 @@ class KITTI_Multi(BaseMultiViewDataset):
         self.load_imu = load_imu  # Flag to control IMU loading
         self.scenes_filter = scenes  # Filter for specific scenes
         self.video = True  # KITTI is a video dataset
-        self.is_metric = False  # Changed to False to match RE10K
+        self.is_metric = True  # Changed to False to match RE10K
         self.max_interval = 128  # Changed to match RE10K
         super().__init__(*args, **kwargs)
         self.loaded_data = self._load_data()

@@ -332,50 +332,6 @@ class Regr3DPose(Criterion, MultiLoss):
             )
         return norm_factor
 
-    def _ensure_camera_only_shape(self, camera_only, batch_size, device):
-        """確保 camera_only 具有正確的形狀用於廣播操作"""
-        if isinstance(camera_only, bool):
-            return torch.full((batch_size,), camera_only, 
-                             dtype=torch.bool, device=device)
-        elif hasattr(camera_only, 'dim') and camera_only.dim() == 0:  # scalar tensor
-            return camera_only.unsqueeze(0).expand(batch_size)
-        return camera_only
-
-    def _ensure_batch_shape(self, tensor, batch_size):
-        """確保張量具有正確的 batch 形狀 [batch_size, 1]"""
-        if tensor.dim() == 0:  # scalar
-            return tensor.unsqueeze(0).expand(batch_size).unsqueeze(1)
-        elif tensor.dim() == 1:  # [batch_size] or [1]
-            if tensor.size(0) == 1 and batch_size > 1:
-                return tensor.expand(batch_size).unsqueeze(1)
-            else:
-                return tensor.unsqueeze(1)
-        return tensor
-
-    def _has_valid_data(self, data):
-        """統一的有效數據檢查"""
-        if isinstance(data, torch.Tensor):
-            if data.dim() == 0:  # 0-d tensor (scalar)
-                return bool(data.item())
-            else:  # multi-dimensional tensor
-                return bool(data.any())
-        elif hasattr(data, '__iter__'):
-            return any(data)
-        else:
-            return bool(data)
-
-    def _has_non_camera_only_data(self, camera_only):
-        """檢查是否有非 camera_only 的數據"""
-        if isinstance(camera_only, torch.Tensor):
-            if camera_only.dim() == 0:  # 0-d tensor
-                return not bool(camera_only.item())
-            else:  # multi-dimensional tensor
-                return bool((~camera_only).any())
-        elif hasattr(camera_only, '__iter__'):
-            return any(not x for x in camera_only)
-        else:
-            return not bool(camera_only)
-
     def get_norm_factor_poses(self, gt_trans, pr_trans, not_metric_mask):
         batch_size = gt_trans[0].shape[0]
 
@@ -392,8 +348,6 @@ class Regr3DPose(Criterion, MultiLoss):
                 .squeeze(-1)
                 .squeeze(-1)
             )
-            # Ensure the factor has the correct batch dimension and shape [batch_size, 1]
-            norm_factor_gt = self._ensure_batch_shape(norm_factor_gt, batch_size)
         else:
             norm_factor_gt = torch.ones(
                 batch_size, 1, dtype=gt_trans[0].dtype, device=gt_trans[0].device
@@ -418,9 +372,6 @@ class Regr3DPose(Criterion, MultiLoss):
                 .squeeze(-1)
                 .squeeze(-1)
             )
-            # Ensure shape consistency for indexing
-            norm_factor_pr_not_metric = self._ensure_batch_shape(norm_factor_pr_not_metric, not_metric_mask.sum().item())
-            # Don't squeeze since norm_factor_pr[not_metric_mask] expects shape [n, 1]
             norm_factor_pr[not_metric_mask] = norm_factor_pr_not_metric
         return norm_factor_gt, norm_factor_pr
 
@@ -525,9 +476,6 @@ class Regr3DPose(Criterion, MultiLoss):
             pose_only_norm_factor_gt, pose_only_norm_factor_pr = (
                 self.get_norm_factor_poses(gt_trans, pr_trans, not_metric_mask)
             )
-            # Ensure camera_only has the correct shape for broadcasting
-            camera_only = self._ensure_camera_only_shape(camera_only, pose_norm_factor_gt.shape[0], pose_norm_factor_gt.device)
-            
             pose_norm_factor_gt = torch.where(
                 camera_only[:, None], pose_only_norm_factor_gt, pose_norm_factor_gt
             )
@@ -546,9 +494,6 @@ class Regr3DPose(Criterion, MultiLoss):
         )
 
         if any(camera_only):
-            # Ensure camera_only has the correct shape for this section
-            camera_only = self._ensure_camera_only_shape(camera_only, gt_pts_self[0].shape[0], gt_pts_self[0].device)
-            
             # this is equal to a loss for camera intrinsics
             gt_pts_self = [
                 torch.where(
@@ -691,9 +636,6 @@ class Regr3DPose(Criterion, MultiLoss):
                     gt_trans, pr_trans, torch.ones_like(not_metric_mask)
                 )
             )
-            # Ensure camera_only has the correct shape for broadcasting
-            camera_only = self._ensure_camera_only_shape(camera_only, pose_norm_factor_gt.shape[0], pose_norm_factor_gt.device)
-            
             pose_norm_factor_gt = torch.where(
                 camera_only[:, None], pose_only_norm_factor_gt, pose_norm_factor_gt
             )
@@ -720,9 +662,6 @@ class Regr3DPose(Criterion, MultiLoss):
         )
 
         if any(camera_only):
-            # Ensure camera_only has the correct shape for this section
-            camera_only = self._ensure_camera_only_shape(camera_only, gt_pts_self[0].shape[0], gt_pts_self[0].device)
-            
             # this is equal to a loss for camera intrinsics
             gt_pts_self = [
                 torch.where(
@@ -794,7 +733,7 @@ class Regr3DPose(Criterion, MultiLoss):
         )
         rel_trans_err = torch.norm(gt_rel_trans - pr_rel_trans, dim=-1)
         rel_quats_err = torch.norm(gt_rel_quats - pr_rel_quats, dim=-1)
-        return rel_trans_err.mean() + rel_quats_err.mean()
+        return rel_trans_err.mean() + rel_quats_err.mean() * 40.0
 
     def compute_pose_loss(self, gt_poses, pred_poses, masks=None):
         """
@@ -809,18 +748,14 @@ class Regr3DPose(Criterion, MultiLoss):
         if masks == None:
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1).mean()
-                + torch.norm(pred_quats - gt_quats, dim=-1).mean()
+                + torch.norm(pred_quats - gt_quats, dim=-1).mean() * 40.0
             )
         else:
-            # Handle both tensor and scalar masks for multi-GPU compatibility
-            has_valid_mask = self._has_valid_data(masks)
-            
-            if not has_valid_mask:
-                return torch.tensor(0.0, device=gt_trans.device)
-            
+            if not any(masks):
+                return torch.tensor(0.0)
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
-                + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean()
+                + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean() * 40.0
             )
 
         return pose_loss
@@ -904,12 +839,10 @@ class Regr3DPose(Criterion, MultiLoss):
             assert (
                 self.criterion.reduction == "none"
             ), "sky_loss_value should be 0 if no conf loss"
-            if len(ls_cross) > 0:  # 只有当有 cross-view 损失时才处理 sky loss
-                skys_cross = [sky[~camera_only] for sky in skys]
-                for i, l in enumerate(ls_cross):
-                    ls_cross[i] = torch.where(
-                        skys_cross[i][masks_cross[i]], self.sky_loss_value, l
-                    )
+            for i, l in enumerate(ls_cross):
+                ls_cross[i] = torch.where(
+                    skys_cross[i][masks_cross[i]], self.sky_loss_value, l
+                )
 
         for i in range(len(ls_cross)):
             details[self_name + f"_pts3d/{i+1}"] = float(
@@ -954,14 +887,6 @@ class Regr3DPoseBatchList(Regr3DPose):
         self.single_view_criterion = ScaleInvLoss()
 
     def reorg(self, ls_b, masks_b):
-        # 检查输入是否为空
-        if not masks_b or len(masks_b) == 0:
-            return []  # 返回空列表而不是崩溃
-        
-        # 检查 masks_b[0] 是否存在
-        if len(masks_b[0]) == 0:
-            return []  # 如果第一个元素为空，返回空列表
-        
         ids_split = [mask.sum(dim=(1, 2)) for mask in masks_b]
         ls = [[] for _ in range(len(masks_b[0]))]
         for i in range(len(ls_b)):
@@ -996,7 +921,7 @@ class Regr3DPoseBatchList(Regr3DPose):
         single_view = gts[0]["single_view"]
         is_metric = gts[0]["is_metric"]
 
-        # 如果只有 pose label（camera_only 全为 True），只计算 pose_loss
+
         if isinstance(camera_only, bool):
             all_camera_only = camera_only
         elif hasattr(camera_only, 'all'):
@@ -1005,75 +930,94 @@ class Regr3DPoseBatchList(Regr3DPose):
             all_camera_only = bool(np.all(camera_only))
 
         if all_camera_only:
-            # 计算 transform_loss：将 self point cloud 通过预测的 camera pose 转换到 world 坐标
             details = {}
             pose_loss = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
             details["pose_loss"] = pose_loss
             
-            # 计算 transform_loss
-            from dust3r.utils.geometry import geotrf
-            from dust3r.utils.camera import pose_encoding_to_camera
-            
-            alpha = 1.0  # ConfLoss 的 alpha 参数
+            gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
+            gt_quats = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BXNX3
+            pr_trans = torch.stack([pr[0] for pr in pr_poses], dim=1)  # BxNx4
+            pr_quats = torch.stack([pr[1] for pr in pr_poses], dim=1)  # BxNx4
+
+            rel_pose_loss = self.compute_relative_pose_loss(
+                gt_trans, gt_quats, pr_trans, pr_quats, masks=None
+            )
+            details["relative_pose_loss"] = rel_pose_loss
+
+            # 先把所有 GT pose 轉成 4x4 矩陣，避免 loop 裡重複做
+            num_views = len(preds)
+            P_gt = []
+            for i in range(num_views):
+                gt_pose_7d = torch.cat([gt_poses[i][0], gt_poses[i][1]], dim=-1)  # (B,7)
+                P_gt.append(pose_encoding_to_camera(gt_pose_7d))  # list of (B,4,4)
+            P_gt = torch.stack(P_gt, dim=0)  # (N, B, 4, 4)
+
+            # 預先算 frame 1 的 GT inverse（用作 cross 的 reference 起點）
+            P1_gt = P_gt[0]  # (B,4,4)
+            inv_P1_gt = torch.linalg.inv(P1_gt)  # (B,4,4)
+
+            relative_transform_loss = []
+            for i in range(num_views):
+                for j in range(num_views):
+                    if i == j:
+                        continue
+
+                    # --- cross-view prediction: 把 pred_pts_cross[i] 從 frame1 -> frame j，用 GT pose ---
+                    Pj_gt = P_gt[j]  # (B,4,4)
+                    T_cross_gt = Pj_gt @ inv_P1_gt  # frame1 -> j
+                    pts_pred_cross_in_j = geotrf(T_cross_gt, pred_pts_cross[i])  # (B, H, W, 3)
+
+                    # --- self-view prediction: 把 pred_pts_self[i] 從 frame i -> frame j，用 GT pose ---
+                    Pi_gt = P_gt[i]
+                    inv_Pi_gt = torch.linalg.inv(Pi_gt)
+                    T_self_gt = Pj_gt @ inv_Pi_gt  # i -> j
+                    pts_self_in_j = geotrf(T_self_gt, pred_pts_self[i])  # (B, H, W, 3)
+                    loss_ij = self.single_view_criterion(pts_pred_cross_in_j, pts_self_in_j.detach(), masks[i]).mean()
+                    relative_transform_loss.append(loss_ij)
+
+            avg_relative_transform_loss = torch.stack(relative_transform_loss).mean()
+            details["relative_transform_loss"] = float(avg_relative_transform_loss.item())
+
+
             transform_losses = []
             for i in range(len(preds)):
-                # 获取预测的相机位姿 (B, 7) -> (B, 4, 4)
-                pred_pose_7d = preds[i]["camera_pose"]  # (B, 7)
-                pred_pose_4x4 = pose_encoding_to_camera(pred_pose_7d)  # (B, 4, 4)
-                
-                # 获取 self point cloud 和置信度
+                gt_pose_7d = torch.cat([gt_poses[i][0], gt_poses[i][1]], dim=-1) # (B, 7)
+                gt_pose_4x4 = pose_encoding_to_camera(gt_pose_7d)  # (B, 4, 4)
                 pred_pts_self_i = pred_pts_self[i]  # (B, H, W, 3)
-                conf_self = preds[i]["conf_self"]  # (B, H, W)
-                
-                # 将 self point cloud 转换到 world 坐标
-                pred_pts_world = geotrf(pred_pose_4x4, pred_pts_self_i)  # (B, H, W, 3)
-                
-                # 获取 GT world point cloud
-                gt_pts_world = gts[i]["pts3d"]  # (B, H, W, 3)
-                
-                # 获取有效 mask
-                valid_mask = masks[i]  # (B, H, W)
-                
-                # 计算有效像素的损失 - 使用尺度不变损失
-                if valid_mask.sum() > 0:
-                    # 使用 ScaleInvLoss 的逻辑进行归一化
-                    # 计算预测点云的归一化因子
-                    pred_norm_factor = (torch.norm(pred_pts_world, dim=-1) * valid_mask).sum(dim=(1, 2)) / valid_mask.sum(dim=(1, 2)).clamp(min=1e-6)
-                    # 计算 GT 点云的归一化因子
-                    gt_norm_factor = (torch.norm(gt_pts_world, dim=-1) * valid_mask).sum(dim=(1, 2)) / valid_mask.sum(dim=(1, 2)).clamp(min=1e-6)
-                    
-                    # 归一化点云
-                    pred_pts_world_norm = pred_pts_world / pred_norm_factor.view(-1, 1, 1, 1).clamp(min=1e-6)
-                    gt_pts_world_norm = gt_pts_world / gt_norm_factor.view(-1, 1, 1, 1).clamp(min=1e-6)
-                    
-                    # 计算归一化后的点云差异
-                    pred_valid = pred_pts_world_norm[valid_mask]  # (N, 3)
-                    gt_valid = gt_pts_world_norm[valid_mask]  # (N, 3)
-                    conf_valid = conf_self[valid_mask]  # (N,)
-                    
-                    # 计算 L2 距离（更适合 3D 几何）
-                    point_distances = torch.norm(pred_valid - gt_valid, dim=-1)  # (N,)
-                    
-                    # 置信度加权 - 使用与 ConfLoss 一致的公式
-                    conf_log = torch.log(conf_valid).clip(-10, 10)  # 防止数值不稳定
-                    weighted_loss = point_distances * conf_valid - alpha * conf_log
-                    transform_loss = weighted_loss.mean()
-                else:
-                    transform_loss = torch.tensor(0.0, device=pred_pts_self_i.device)
-                
+                pred_pts_world = geotrf(gt_pose_4x4, pred_pts_self_i)  # (B, H, W, 3)
+                pred_pts_cross_i = pred_pts_cross[i]  # (B, H, W, 3)
+                transform_loss = self.single_view_criterion(pred_pts_world, pred_pts_cross_i, masks[i]).mean()
                 transform_losses.append(transform_loss)
-                details[f"transform_loss/{i+1}"] = float(transform_loss)
-                details[f"transform_conf_{i+1}"] = conf_self.detach()
+            avg_transform_loss = torch.stack(transform_losses).mean()
+            details["transform_loss"] = float(avg_transform_loss.item())
             
-            # 计算平均 transform loss
-            if len(transform_losses) > 0:
-                avg_transform_loss = sum(transform_losses) / len(transform_losses)
-                details["avg_transform_loss"] = float(avg_transform_loss)
+            relative_pose_token_losses = []
+            for i in range(1, len(preds)):
+                # 檢查是否有 relative_pose
+                if "relative_pose" not in preds[i]:
+                    continue
+                    
+                pred_rel_pose = preds[i]["relative_pose"]  # (B, 7)
                 
-                # 总损失 = pose_loss + transform_loss
-                total_loss = pose_loss + avg_transform_loss
-            else:
-                total_loss = pose_loss
+                # 使用正確的相對姿態計算函數
+                gt_trans_prev = gt_poses[i-1][0]  # (B, 3)
+                gt_quat_prev = gt_poses[i-1][1]   # (B, 4)
+                gt_trans_curr = gt_poses[i][0]    # (B, 3)
+                gt_quat_curr = gt_poses[i][1]     # (B, 4)
+                
+                gt_rel_trans, gt_rel_quat = relative_pose_absT_quatR(
+                    gt_trans_curr, gt_quat_curr, gt_trans_prev, gt_quat_prev
+                )
+                
+                rel_trans_loss = torch.norm(pred_rel_pose[:, :3] - gt_rel_trans, dim=-1).mean()
+                rel_quat_loss = torch.norm(pred_rel_pose[:, 3:] - gt_rel_quat, dim=-1).mean() * 40.0
+                rel_pose_token_loss = rel_trans_loss + rel_quat_loss
+                
+                relative_pose_token_losses.append(rel_pose_token_loss)
+            avg_relative_pose_token_loss = torch.stack(relative_pose_token_losses).mean()
+            details["relative_pose_token_loss"] = float(avg_relative_pose_token_loss.item())
+
+            total_loss = rel_pose_loss #pose_loss + rel_pose_loss + avg_transform_loss + avg_relative_transform_loss #+ avg_relative_pose_token_loss
             
             return total_loss, details
 
@@ -1125,8 +1069,8 @@ class Regr3DPoseBatchList(Regr3DPose):
         details = {}
         for i in range(len(ls_self)):
             details[self_name + f"_self_pts3d/{i+1}"] = float(ls_self[i].mean())
-            details[f"gt_img{i+1}"] = gts[i]["img"].permute(0, 2, 3, 1).detach()
             details[f"self_conf_{i+1}"] = preds[i]["conf_self"].detach()
+            details[f"gt_img{i+1}"] = gts[i]["img"].permute(0, 2, 3, 1).detach()
             details[f"valid_mask_{i+1}"] = masks[i].detach()
 
             if "img_mask" in gts[i] and "ray_mask" in gts[i]:
@@ -1136,12 +1080,9 @@ class Regr3DPoseBatchList(Regr3DPose):
             if "desc" in preds[i]:
                 details[f"desc_{i+1}"] = preds[i]["desc"].detach()
 
-        # cross view loss and details
-        # 检查是否有非 camera_only 的数据
-        if not any(~camera_only):
-            # 如果所有数据都是 camera_only=True，跳过 cross-view 损失计算
-            ls_cross = []
-            masks_cross = []
+        if "Quantile" in self.criterion.__class__.__name__:
+            # quantile masks have already been determined by self view losses, here pass in None as quantile
+            raise NotImplementedError
         else:
             gt_pts_cross_b = torch.unbind(
                 torch.stack(gt_pts_cross, dim=1)[~camera_only], dim=0
@@ -1174,18 +1115,17 @@ class Regr3DPoseBatchList(Regr3DPose):
                         )
                     )
             ls_cross = self.reorg(ls_cross_b, masks_cross_b)
-            masks_cross = [mask[~camera_only] for mask in masks]
 
         if self.sky_loss_value > 0:
             assert (
                 self.criterion.reduction == "none"
             ), "sky_loss_value should be 0 if no conf loss"
-            if len(ls_cross) > 0:  # 只有当有 cross-view 损失时才处理 sky loss
-                skys_cross = [sky[~camera_only] for sky in skys]
-                for i, l in enumerate(ls_cross):
-                    ls_cross[i] = torch.where(
-                        skys_cross[i][masks_cross[i]], self.sky_loss_value, l
-                    )
+            masks_cross = [mask[~camera_only] for mask in masks]
+            skys_cross = [sky[~camera_only] for sky in skys]
+            for i, l in enumerate(ls_cross):
+                ls_cross[i] = torch.where(
+                    skys_cross[i][masks_cross[i]], self.sky_loss_value, l
+                )
 
         for i in range(len(ls_cross)):
             details[self_name + f"_pts3d/{i+1}"] = float(
@@ -1200,9 +1140,6 @@ class Regr3DPoseBatchList(Regr3DPose):
             np.arange(len(ls_self)).tolist() + np.arange(len(ls_cross)).tolist()
         )
         pose_masks = pose_masks * gts[i]["img_mask"]
-        # Ensure pose_masks is properly shaped for multi-GPU
-        if isinstance(pose_masks, torch.Tensor) and pose_masks.numel() == 1:
-            pose_masks = pose_masks.squeeze()
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
 
         return Sum(*list(zip(ls, masks))), (details | monitoring)
@@ -1267,12 +1204,6 @@ class ConfLoss(MultiLoss):
             conf_key = "conf_self" if is_self[i] else "conf"
             if not is_self[i]:
                 camera_only = gts[0]["camera_only"]
-                # 检查是否有非 camera_only 的数据 - handle 0-d tensor for multi-GPU
-                has_non_camera_only = self._has_non_camera_only_data(camera_only)
-                
-                if not has_non_camera_only:
-                    # 如果所有数据都是 camera_only=True，跳过这个损失
-                    continue
                 conf, log_conf = self.get_conf_log(
                     pred[conf_key][~camera_only][losses_and_masks[i][1]]
                 )
@@ -1297,12 +1228,7 @@ class ConfLoss(MultiLoss):
         details.pop("is_self", None)
         details.pop("img_ids", None)
 
-        # 确保有有效的损失
-        if len(conf_losses) > 0:
-            final_loss = sum(conf_losses) / len(conf_losses) * 2.0
-        else:
-            final_loss = torch.tensor(0.0, device=gts[0]["img"].device)
-            
+        final_loss = sum(conf_losses) / len(conf_losses) * 2.0
         if "pose_loss" in details:
             final_loss = (
                 final_loss + details["pose_loss"] #.clip(max=0.3) * 5.0

@@ -62,14 +62,18 @@ def rgb(ftensor, true_shape=None):
     return img.clip(min=0, max=1)
 
 
-def _resize_pil_image(img, long_edge_size):
+def _resize_pil_image(img, size):
+    # 支援 tuple (width, height) 直接 resize
+    if isinstance(size, tuple):
+        return img.resize(size, resample=PIL.Image.BILINEAR)
+    # 原本的 int 處理邏輯
     S = max(img.size)
+    long_edge_size = size
     if S > long_edge_size:
-        interp = PIL.Image.LANCZOS
-    elif S <= long_edge_size:
-        interp = PIL.Image.BICUBIC
-    new_size = tuple(int(round(x * long_edge_size / S)) for x in img.size)
-    return img.resize(new_size, interp)
+        scale = long_edge_size / S
+        new_size = tuple([int(x * scale) for x in img.size])
+        img = img.resize(new_size, resample=PIL.Image.BILINEAR)
+    return img
 
 
 def load_images(folder_or_list, size, square_ok=False, verbose=True):

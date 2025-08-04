@@ -52,14 +52,14 @@ test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_va
 resolution: [(512, 384)]
 
 allow_repeat: False
-dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_01'], load_imu=${training_mode.enable_imu}, aug_crop=16, resolution=[(512, 384)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
+dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, aug_crop=16, resolution=[(512, 384)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
 
 
 train_dataset: 200 @ ${dataset1}
-test_dataset: 200 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_01'], load_imu=${training_mode.enable_imu}, resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+test_dataset: 40 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
 seed: 0
-batch_size: 1
+batch_size: 2
 accum_iter: 4
 gradient_checkpointing: False
 epochs: 10
@@ -70,8 +70,8 @@ min_lr: 1e-7
 warmup_epochs: 0.5
 amp: 1
 
-num_workers: 2
-world_size: 2
+num_workers: 8
+world_size: 1
 local-rank: -1
 dist_url: 'env://'
 rank: 0
@@ -85,8 +85,10 @@ keep_freq: 1
 print_freq: 10
 print_img_freq: 50000000
 num_imgs_vis: 4
+
+# Output configuration
 save_dir: 'checkpoints'
-exp_name: 'cut3r_imu_only'  # Updated name to reflect IMU-only training
+exp_name: 'cut3r_relative_decoder'  # Updated name to reflect IMU-only training
 task: 'cut3r_imu'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
@@ -105,6 +107,6 @@ imu_config:
 
 # Hydra configuration
 hydra:
-  verbose: True
+  verbose: False
   run:
     dir: ./${save_dir}/${exp_name}

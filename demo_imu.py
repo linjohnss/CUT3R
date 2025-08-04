@@ -12,8 +12,7 @@ Usage:
 
 Example:
     python demo_imu.py --model_path src/cut3r_512_dpt_4_64.pth \
-        --lora_path src/checkpoints/cut3r_imu_lora/lora_weights_final.pth \
-        --imu_path src/checkpoints/cut3r_imu_lora/imu_weights_final.pth \
+        --imu_path src/checkpoints/cut3r_relative_decoder/imu_weights_best.pth \
         --seq_path /project2/larg3r/dataset/dust3r_data/processed_kitti/kitti_00/rgb \
         --imu_data_path /project2/larg3r/dataset/dust3r_data/processed_kitti/kitti_00/imu \
         --device cuda --size 512
@@ -96,6 +95,12 @@ def parse_args():
         default="./demo_tmp",
         help="value for tempfile.tempdir",
     )
+    parser.add_argument(
+        "--update_interval",
+        type=int,
+        default=1,
+        help="Update state every N frames (default: 8). Set to 1 to update every frame.",
+    )
 
     return parser.parse_args()
 
@@ -145,7 +150,7 @@ def load_imu_data(imu_dir, img_basenames):
 
 
 def prepare_input(
-    img_paths, img_mask, size, imu_data_list=None, revisit=1, update=True
+    img_paths, img_mask, size, imu_data_list=None, revisit=1, update=True, update_interval=1
 ):
     """
     Prepare input views for inference from a list of image paths with IMU data.
@@ -157,6 +162,7 @@ def prepare_input(
         imu_data_list (list, optional): List of IMU data arrays.
         revisit (int): How many times to revisit each view.
         update (bool): Whether to update the state on revisits.
+        update_interval (int): Update state every N frames (default: 1).
 
     Returns:
         list: A list of view dictionaries.
@@ -168,6 +174,10 @@ def prepare_input(
     views = []
 
     for i in range(len(images)):
+        # Determine if this frame should update state
+        # First frame (i=0) always updates, then every update_interval frames
+        should_update = (i == 0) or (i % update_interval == 0)
+        
         view = {
             "img": images[i]["img"],
             "ray_map": torch.full(
@@ -187,7 +197,7 @@ def prepare_input(
             ),
             "img_mask": torch.tensor(True).unsqueeze(0),
             "ray_mask": torch.tensor(False).unsqueeze(0),
-            "update": torch.tensor(True).unsqueeze(0),
+            "update": torch.tensor(should_update).unsqueeze(0),
             "reset": torch.tensor(False).unsqueeze(0),
         }
     
@@ -420,64 +430,86 @@ def load_lora_weights(model, lora_path, device):
 
 def load_imu_weights(model, imu_path, device):
     """
-    Load IMU weights into the model.
-    
-    Args:
-        model: The model to load IMU weights into
-        imu_path: Path to the IMU weights file
-        device: Device to load weights on
+    Load IMU weights and convert model to CUT3RIMU if needed
     """
-    from src.dust3r.models.imu_encoder import CUT3RIMU
+    if not os.path.exists(imu_path):
+        print(f"Warning: IMU path {imu_path} does not exist")
+        return model
     
-    print(f"Loading IMU weights from {imu_path}...")
+    print(f"Loading IMU weights from {imu_path}")
+    imu_state_dict = torch.load(imu_path, map_location=device)
     
-    # Load IMU checkpoint
-    imu_checkpoint = torch.load(imu_path, map_location=device)
-    
-    # Check if this is a CUT3RIMU model
-    if not hasattr(model, 'imu_encoder'):
-        print("Converting model to IMU-enhanced model...")
-        # Create IMU config (use default values)
-        imu_config = {
-            'input_dim': 6,
-            'seq_len': 10,
-            'dropout': 0.1,
-            'fusion_method': 'add',
-            'num_heads': 8
-        }
-        model = CUT3RIMU(model, imu_config)
-        # Move the entire model to the correct device
-        model = model.to(device)
-        print("Model converted to IMU-enhanced model")
-    
-    # Load IMU encoder weights
-    if 'imu_encoder' in imu_checkpoint:
-        model.imu_encoder.load_state_dict(imu_checkpoint['imu_encoder'])
-        print("IMU encoder weights loaded successfully!")
+    # Check if model is already CUT3RIMU
+    if hasattr(model, 'imu_encoder') and hasattr(model, 'cut3r_model'):
+        print("Model is already CUT3RIMU, loading weights...")
+        # Load IMU encoder weights
+        if 'imu_encoder' in imu_state_dict:
+            model.imu_encoder.load_state_dict(imu_state_dict['imu_encoder'])
+            print("✅ Loaded IMU encoder weights")
+        
+        # Load IMU pose retriever weights
+        if 'imu_pose_retriever' in imu_state_dict and hasattr(model, 'imu_pose_retriever'):
+            model.imu_pose_retriever.load_state_dict(imu_state_dict['imu_pose_retriever'])
+            print("✅ Loaded IMU pose retriever weights")
+        
+        # Load relative pose decoder weights
+        if 'relative_pose_decoder' in imu_state_dict and hasattr(model, 'relative_pose_decoder'):
+            model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
+            print("✅ Loaded relative pose decoder weights")
+        
+        # Load pose token transformer weights
+        if 'pose_token_transformer' in imu_state_dict and hasattr(model, 'pose_token_transformer'):
+            model.pose_token_transformer.load_state_dict(imu_state_dict['pose_token_transformer'])
+            print("✅ Loaded pose token transformer weights")
+        
+        # Load pose token fusion MLP weights
+        if 'pose_token_fusion_mlp' in imu_state_dict and hasattr(model, 'pose_token_fusion_mlp'):
+            model.pose_token_fusion_mlp.load_state_dict(imu_state_dict['pose_token_fusion_mlp'])
+            print("✅ Loaded pose token fusion MLP weights")
+        
+        return model
     else:
-        print("Warning: No IMU encoder weights found in checkpoint")
-    
-    # Load IMU projection weights (new architecture)
-    if 'imu_proj' in imu_checkpoint:
-        print("Warning: Old imu_proj weights found but not used in simplified architecture")
-    
-    # Load IMU fusion weights (for backward compatibility with old checkpoints)
-    if 'imu_fusion' in imu_checkpoint:
-        print("Warning: Old imu_fusion weights found but not used in new direct-addition architecture")
-    
-    # Load learnable weights for pose token fusion
-    if 'imu_weight' in imu_checkpoint:
-        model.imu_weight.data = imu_checkpoint['imu_weight']
-        print("IMU weight parameter loaded successfully!")
-    if 'pose_weight' in imu_checkpoint:
-        model.pose_weight.data = imu_checkpoint['pose_weight']
-        print("Pose weight parameter loaded successfully!")
-    
-    # Ensure model is in eval mode
-    model.eval()
-    
-    print("IMU weights loaded successfully!")
-    return model
+        # Convert to CUT3RIMU
+        print("Converting model to CUT3RIMU...")
+        from dust3r.imu_encoder import CUT3RIMU
+        
+        # Create IMU config from the loaded weights
+        imu_config = {
+            'input_dim': 6,  # Default IMU input dimension
+            'seq_len': 10,   # Default sequence length
+            'dropout': 0.1   # Default dropout
+        }
+        
+        # Create CUT3RIMU model (device is handled in initialization)
+        imu_model = CUT3RIMU(model, imu_config)
+        
+        # Load IMU encoder weights
+        if 'imu_encoder' in imu_state_dict:
+            imu_model.imu_encoder.load_state_dict(imu_state_dict['imu_encoder'])
+            print("✅ Loaded IMU encoder weights")
+        
+        # Load IMU pose retriever weights
+        if 'imu_pose_retriever' in imu_state_dict and hasattr(imu_model, 'imu_pose_retriever'):
+            imu_model.imu_pose_retriever.load_state_dict(imu_state_dict['imu_pose_retriever'])
+            print("✅ Loaded IMU pose retriever weights")
+        
+        # Load relative pose decoder weights
+        if 'relative_pose_decoder' in imu_state_dict and hasattr(imu_model, 'relative_pose_decoder'):
+            imu_model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
+            print("✅ Loaded relative pose decoder weights")
+        
+        # Load pose token transformer weights
+        if 'pose_token_transformer' in imu_state_dict and hasattr(imu_model, 'pose_token_transformer'):
+            imu_model.pose_token_transformer.load_state_dict(imu_state_dict['pose_token_transformer'])
+            print("✅ Loaded pose token transformer weights")
+        
+        # Load pose token fusion MLP weights
+        if 'pose_token_fusion_mlp' in imu_state_dict and hasattr(imu_model, 'pose_token_fusion_mlp'):
+            imu_model.pose_token_fusion_mlp.load_state_dict(imu_state_dict['pose_token_fusion_mlp'])
+            print("✅ Loaded pose token fusion MLP weights")
+        
+        print("✅ Successfully converted to CUT3RIMU and loaded all IMU weights")
+        return imu_model
 
 
 def run_inference(args):
@@ -539,14 +571,39 @@ def run_inference(args):
 
     # Prepare input views.
     print("Preparing input views...")
+    # 強制 resize 成 (512, 384)
+    fixed_width, fixed_height = 512, 384
+    
+    # Use prepare_input function with update_interval
     views = prepare_input(
-        img_paths=img_paths,
-        img_mask=img_mask,
-        size=args.size,
-        imu_data_list=imu_data_list,
-        revisit=1,
-        update=True,
+        img_paths, 
+        img_mask, 
+        size=(fixed_width, fixed_height), 
+        imu_data_list=imu_data_list, 
+        revisit=1, 
+        update=True, 
+        update_interval=args.update_interval
     )
+    
+    # Log which frames will update state
+    update_frames = [i for i, view in enumerate(views) if view["update"].item()]
+    print(f"State update interval: {args.update_interval}")
+    print(f"Frames that will update state: {update_frames}")
+    print(f"Total frames: {len(views)}, Frames with state update: {len(update_frames)}")
+    
+    # Move views to device
+    for view in views:
+        view["img"] = view["img"].to(device)
+        view["ray_map"] = view["ray_map"].to(device)
+        view["true_shape"] = view["true_shape"].to(device)
+        view["camera_pose"] = view["camera_pose"].to(device)
+        view["img_mask"] = view["img_mask"].to(device)
+        view["ray_mask"] = view["ray_mask"].to(device)
+        view["update"] = view["update"].to(device)
+        view["reset"] = view["reset"].to(device)
+        if "imu" in view:
+            view["imu"] = view["imu"].to(device)
+    
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
 
@@ -565,6 +622,22 @@ def run_inference(args):
     # Load IMU weights if provided
     if args.imu_path and os.path.exists(args.imu_path):
         model = load_imu_weights(model, args.imu_path, device)
+        # Ensure model is on the correct device
+        model = model.to(device)
+        # Verify IMU model is properly loaded
+        if hasattr(model, 'imu_encoder'):
+            print("✅ IMU model successfully loaded and ready for inference")
+            print(f"   - IMU encoder: {type(model.imu_encoder).__name__}")
+            if hasattr(model, 'imu_pose_retriever'):
+                print(f"   - IMU pose retriever: {type(model.imu_pose_retriever).__name__}")
+            if hasattr(model, 'relative_pose_decoder'):
+                print(f"   - Relative pose decoder: {type(model.relative_pose_decoder).__name__}")
+            if hasattr(model, 'pose_token_transformer'):
+                print(f"   - Pose token transformer: {type(model.pose_token_transformer).__name__}")
+            if hasattr(model, 'pose_token_fusion_mlp'):
+                print(f"   - Pose token fusion MLP: {type(model.pose_token_fusion_mlp).__name__}")
+        else:
+            print("❌ Warning: Model does not have IMU components after loading weights")
     elif args.imu_path:
         print(f"Warning: IMU path {args.imu_path} does not exist. Running without IMU enhancement.")
     else:

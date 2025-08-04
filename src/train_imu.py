@@ -30,7 +30,7 @@ from dust3r.model import (
     inf,
     strip_module,
 )  # noqa: F401, needed when loading the model
-from dust3r.models.imu_encoder import CUT3RIMU  # IMU-enhanced model
+from dust3r.imu_encoder import CUT3RIMU  # IMU-enhanced model
 from dust3r.datasets import get_data_loader
 from dust3r.losses import *  # noqa: F401, needed when loading the model
 from dust3r.inference import loss_of_one_batch, loss_of_one_batch_tbptt  # noqa
@@ -125,10 +125,11 @@ def create_imu_enhanced_model(base_model, imu_config):
 
 def freeze_parameters_for_imu_training(model):
     """
-    Freeze parameters for IMU training:
+    Freeze parameters for new IMU training with IMUAwarePoseRetriever:
     - Keep CUT3R frozen (except LoRA if enabled)
     - Train IMU encoder
-    - Train IMU fusion weights (pose_weight, imu_weight)
+    - Train NEW IMUAwarePoseRetriever
+    - FREEZE original pose_retriever
     - Train LoRA parameters if enabled
     """
     if not hasattr(model, 'imu_encoder'):
@@ -149,15 +150,46 @@ def freeze_parameters_for_imu_training(model):
         imu_encoder_params += 1
     printer.info(f"Unfroze {imu_encoder_params} IMU encoder parameters")
     
-    # Unfreeze IMU fusion weights
-    fusion_params = 0
-    if hasattr(model, 'imu_weight'):
-        model.imu_weight.requires_grad = True
-        fusion_params += 1
-    if hasattr(model, 'pose_weight'):
-        model.pose_weight.requires_grad = True
-        fusion_params += 1
-    printer.info(f"Unfroze {fusion_params} IMU fusion weight parameters")
+    # Unfreeze NEW IMU-aware pose retriever
+    imu_pose_retriever_params = 0
+    if hasattr(model, 'imu_pose_retriever'):
+        for param in model.imu_pose_retriever.parameters():
+            param.requires_grad = True
+            imu_pose_retriever_params += 1
+        printer.info(f"Unfroze {imu_pose_retriever_params} IMU pose retriever parameters")
+    
+    # Unfreeze relative pose decoder
+    relative_pose_decoder_params = 0
+    if hasattr(model, 'relative_pose_decoder'):
+        for param in model.relative_pose_decoder.parameters():
+            param.requires_grad = True
+            relative_pose_decoder_params += 1
+        printer.info(f"Unfroze {relative_pose_decoder_params} relative pose decoder parameters")
+    
+    # Unfreeze pose token transformer
+    pose_token_transformer_params = 0
+    if hasattr(model, 'pose_token_transformer'):
+        for param in model.pose_token_transformer.parameters():
+            param.requires_grad = True
+            pose_token_transformer_params += 1
+        printer.info(f"Unfroze {pose_token_transformer_params} pose token transformer parameters")
+    
+    # Unfreeze pose token fusion MLP
+    pose_token_fusion_mlp_params = 0
+    if hasattr(model, 'pose_token_fusion_mlp'):
+        for param in model.pose_token_fusion_mlp.parameters():
+            param.requires_grad = True
+            pose_token_fusion_mlp_params += 1
+        printer.info(f"Unfroze {pose_token_fusion_mlp_params} pose token fusion MLP parameters")
+    
+    # EXPLICITLY freeze original pose retriever
+    original_pose_retriever_params = 0
+    if hasattr(model, 'cut3r_model') and hasattr(model.cut3r_model, 'pose_retriever'):
+        for param in model.cut3r_model.pose_retriever.parameters():
+            param.requires_grad = False
+            original_pose_retriever_params += 1
+        printer.info(f"Explicitly froze {original_pose_retriever_params} original pose retriever parameters")
+
     
     # Unfreeze LoRA parameters in the wrapped CUT3R model
     lora_params = 0
@@ -175,6 +207,32 @@ def freeze_parameters_for_imu_training(model):
     printer.info(f"Total parameters: {total_params:,}")
     printer.info(f"Trainable parameters: {total_trainable:,}")
     printer.info(f"Trainable ratio: {total_trainable/total_params*100:.3f}%")
+    
+    # Breakdown of trainable parameters
+    if hasattr(model, 'imu_encoder'):
+        imu_enc_trainable = sum(p.numel() for p in model.imu_encoder.parameters() if p.requires_grad)
+        printer.info(f"  - IMU Encoder: {imu_enc_trainable:,} parameters")
+    
+    if hasattr(model, 'imu_pose_retriever'):
+        imu_ret_trainable = sum(p.numel() for p in model.imu_pose_retriever.parameters() if p.requires_grad)
+        printer.info(f"  - IMU Pose Retriever: {imu_ret_trainable:,} parameters")
+    
+    if hasattr(model, 'relative_pose_decoder'):
+        rel_dec_trainable = sum(p.numel() for p in model.relative_pose_decoder.parameters() if p.requires_grad)
+        printer.info(f"  - Relative Pose Decoder: {rel_dec_trainable:,} parameters")
+    
+    if hasattr(model, 'pose_token_transformer'):
+        pose_trans_trainable = sum(p.numel() for p in model.pose_token_transformer.parameters() if p.requires_grad)
+        printer.info(f"  - Pose Token Transformer: {pose_trans_trainable:,} parameters")
+    
+    if hasattr(model, 'pose_token_fusion_mlp'):
+        pose_mlp_trainable = sum(p.numel() for p in model.pose_token_fusion_mlp.parameters() if p.requires_grad)
+        printer.info(f"  - Pose Token Fusion MLP: {pose_mlp_trainable:,} parameters")
+    
+    if lora_params > 0:
+        lora_trainable = sum(p.numel() for name, p in model.cut3r_model.named_parameters() 
+                           if p.requires_grad and ('lora_A' in name or 'lora_B' in name))
+        printer.info(f"  - LoRA: {lora_trainable:,} parameters")
     
     if total_trainable == 0:
         printer.error("❌ NO TRAINABLE PARAMETERS FOUND!")
@@ -443,9 +501,30 @@ def train(args):
             imu_path = os.path.join(args.output_dir, f"imu_weights_{fname}.pth")
             imu_state_dict = {
                 'imu_encoder': actual_model.imu_encoder.state_dict(),
-                'imu_weight': actual_model.imu_weight.data,
-                'pose_weight': actual_model.pose_weight.data,
             }
+            
+            # Save new IMU-aware pose retriever if it exists
+            if hasattr(actual_model, 'imu_pose_retriever'):
+                imu_state_dict['imu_pose_retriever'] = actual_model.imu_pose_retriever.state_dict()
+            
+            # Save relative pose decoder if it exists
+            if hasattr(actual_model, 'relative_pose_decoder'):
+                imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
+            
+            # Save pose token transformer if it exists
+            if hasattr(actual_model, 'pose_token_transformer'):
+                imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
+            
+            # Save pose token fusion MLP if it exists
+            if hasattr(actual_model, 'pose_token_fusion_mlp'):
+                imu_state_dict['pose_token_fusion_mlp'] = actual_model.pose_token_fusion_mlp.state_dict()
+            
+            # Keep old fusion weights for backward compatibility (but they're not used in new architecture)
+            if hasattr(actual_model, 'imu_weight'):
+                imu_state_dict['imu_weight'] = actual_model.imu_weight.data
+            if hasattr(actual_model, 'pose_weight'):
+                imu_state_dict['pose_weight'] = actual_model.pose_weight.data
+            
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
             imu_params = 0
@@ -632,9 +711,30 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
             imu_path = output_dir / "imu_weights_final.pth"
             imu_state_dict = {
                 'imu_encoder': actual_model.imu_encoder.state_dict(),
-                'imu_weight': actual_model.imu_weight.data,
-                'pose_weight': actual_model.pose_weight.data,
             }
+            
+            # Save new IMU-aware pose retriever if it exists
+            if hasattr(actual_model, 'imu_pose_retriever'):
+                imu_state_dict['imu_pose_retriever'] = actual_model.imu_pose_retriever.state_dict()
+            
+            # Save relative pose decoder if it exists
+            if hasattr(actual_model, 'relative_pose_decoder'):
+                imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
+            
+            # Save pose token transformer if it exists
+            if hasattr(actual_model, 'pose_token_transformer'):
+                imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
+            
+            # Save pose token fusion MLP if it exists
+            if hasattr(actual_model, 'pose_token_fusion_mlp'):
+                imu_state_dict['pose_token_fusion_mlp'] = actual_model.pose_token_fusion_mlp.state_dict()
+            
+            # Keep old fusion weights for backward compatibility (but they're not used in new architecture)
+            if hasattr(actual_model, 'imu_weight'):
+                imu_state_dict['imu_weight'] = actual_model.imu_weight.data
+            if hasattr(actual_model, 'pose_weight'):
+                imu_state_dict['pose_weight'] = actual_model.pose_weight.data
+            
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
             imu_params = 0
@@ -727,9 +827,30 @@ def train_one_epoch(
             imu_path = os.path.join(args.output_dir, f"imu_weights_{fname}.pth")
             imu_state_dict = {
                 'imu_encoder': actual_model.imu_encoder.state_dict(),
-                'imu_weight': actual_model.imu_weight.data,
-                'pose_weight': actual_model.pose_weight.data,
             }
+            
+            # Save new IMU-aware pose retriever if it exists
+            if hasattr(actual_model, 'imu_pose_retriever'):
+                imu_state_dict['imu_pose_retriever'] = actual_model.imu_pose_retriever.state_dict()
+            
+            # Save relative pose decoder if it exists
+            if hasattr(actual_model, 'relative_pose_decoder'):
+                imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
+            
+            # Save pose token transformer if it exists
+            if hasattr(actual_model, 'pose_token_transformer'):
+                imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
+            
+            # Save pose token fusion MLP if it exists
+            if hasattr(actual_model, 'pose_token_fusion_mlp'):
+                imu_state_dict['pose_token_fusion_mlp'] = actual_model.pose_token_fusion_mlp.state_dict()
+            
+            # Keep old fusion weights for backward compatibility (but they're not used in new architecture)
+            if hasattr(actual_model, 'imu_weight'):
+                imu_state_dict['imu_weight'] = actual_model.imu_weight.data
+            if hasattr(actual_model, 'pose_weight'):
+                imu_state_dict['pose_weight'] = actual_model.pose_weight.data
+            
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
             imu_params = 0
@@ -778,7 +899,7 @@ def train_one_epoch(
                     batch,
                     model,
                     criterion,
-                    chunk_size=4,
+                    chunk_size=8,
                     loss_scaler=loss_scaler,
                     optimizer=optimizer,
                     accelerator=accelerator,
