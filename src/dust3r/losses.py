@@ -21,6 +21,9 @@ from dust3r.utils.camera import (
     pose_encoding_to_camera,
     camera_to_pose_encoding,
     relative_pose_absT_quatR,
+    quaternion_multiply,
+    rotate_vector,
+    standardize_quaternion,
 )
 
 
@@ -460,6 +463,19 @@ class Regr3DPose(Criterion, MultiLoss):
             camera_to_pose_encoding(in_camera1 @ gt["camera_pose"]).clone()
             for gt in gts
         ]
+        # 使用累積的 global pose，如果沒有則使用原始的 camera_pose
+        # pr_poses = []
+        # for pred in preds:
+        #     if "camera_pose" in pred:
+        #         pr_poses.append(pred["camera_pose"].clone())
+        #     else:
+        #         # 如果沒有 camera_pose，創建一個 identity pose
+        #         batch_size = pred["pts3d_in_self_view"].shape[0]
+        #         device = pred["pts3d_in_self_view"].device
+        #         dtype = pred["pts3d_in_self_view"].dtype
+        #         identity_pose = torch.zeros(batch_size, 7, device=device, dtype=dtype)
+        #         identity_pose[:, 3] = 1.0  # quaternion w component
+        #         pr_poses.append(identity_pose)
         pr_poses = [pred["camera_pose"].clone() for pred in preds]
         pose_norm_factor_gt = norm_factor_gt.clone().squeeze(2, 3)
         pose_norm_factor_pr = norm_factor_pr.clone().squeeze(2, 3)
@@ -618,6 +634,19 @@ class Regr3DPose(Criterion, MultiLoss):
             camera_to_pose_encoding(in_camera1 @ gt["camera_pose"]).clone()
             for gt in gts
         ]
+        # 使用累積的 global pose，如果沒有則使用原始的 camera_pose
+        # pr_poses = []
+        # for pred in preds:
+        #     if "camera_pose" in pred:
+        #         pr_poses.append(pred["camera_pose"].clone())
+        #     else:
+        #         # 如果沒有 camera_pose，創建一個 identity pose
+        #         batch_size = pred["pts3d_in_self_view"].shape[0]
+        #         device = pred["pts3d_in_self_view"].device
+        #         dtype = pred["pts3d_in_self_view"].dtype
+        #         identity_pose = torch.zeros(batch_size, 7, device=device, dtype=dtype)
+        #         identity_pose[:, 3] = 1.0  # quaternion w component
+        #         pr_poses.append(identity_pose)
         pr_poses = [pred["camera_pose"].clone() for pred in preds]
         pose_norm_factor_gt = norm_factor_gt.clone().squeeze(2, 3)
         pose_norm_factor_pr = norm_factor_pr.clone().squeeze(2, 3)
@@ -999,25 +1028,65 @@ class Regr3DPoseBatchList(Regr3DPose):
                     
                 pred_rel_pose = preds[i]["relative_pose"]  # (B, 7)
                 
-                # 使用正確的相對姿態計算函數
-                gt_trans_prev = gt_poses[i-1][0]  # (B, 3)
-                gt_quat_prev = gt_poses[i-1][1]   # (B, 4)
-                gt_trans_curr = gt_poses[i][0]    # (B, 3)
-                gt_quat_curr = gt_poses[i][1]     # (B, 4)
+                # 修正：從累積的 global poses 計算出正確的相對姿態
+                # pr_poses[i] 是一個元組 (trans, quat)
+                pred_trans_prev = pr_poses[i-1][0]  # (B, 3)
+                pred_quat_prev = pr_poses[i-1][1]   # (B, 4)
+                pred_trans_curr = pr_poses[i][0]    # (B, 3)
+                pred_quat_curr = pr_poses[i][1]     # (B, 4)
                 
-                gt_rel_trans, gt_rel_quat = relative_pose_absT_quatR(
-                    gt_trans_curr, gt_quat_curr, gt_trans_prev, gt_quat_prev
+                # 計算從前一幀到當前幀的相對姿態（這應該與預測的 relative_pose 一致）
+                pred_rel_trans, pred_rel_quat = relative_pose_absT_quatR(
+                    pred_trans_prev, pred_quat_prev, pred_trans_curr, pred_quat_curr
                 )
                 
-                rel_trans_loss = torch.norm(pred_rel_pose[:, :3] - gt_rel_trans, dim=-1).mean()
-                rel_quat_loss = torch.norm(pred_rel_pose[:, 3:] - gt_rel_quat, dim=-1).mean() * 40.0
+                # 計算相對姿態損失
+                # 比較預測的 relative pose 和從累積 global poses 計算出的相對姿態
+                rel_trans_loss = torch.norm(pred_rel_pose[:, :3] - pred_rel_trans, dim=-1).mean()
+                rel_quat_loss = torch.norm(pred_rel_pose[:, 3:] - pred_rel_quat, dim=-1).mean() * 40.0
                 rel_pose_token_loss = rel_trans_loss + rel_quat_loss
                 
                 relative_pose_token_losses.append(rel_pose_token_loss)
-            avg_relative_pose_token_loss = torch.stack(relative_pose_token_losses).mean()
-            details["relative_pose_token_loss"] = float(avg_relative_pose_token_loss.item())
+            
+            if relative_pose_token_losses:
+                avg_relative_pose_token_loss = torch.stack(relative_pose_token_losses).mean()
+                details["relative_pose_token_loss"] = float(avg_relative_pose_token_loss.item())
+            else:
+                avg_relative_pose_token_loss = torch.tensor(0.0, device=gt_poses[0][0].device)
+                details["relative_pose_token_loss"] = 0.0
 
-            total_loss = rel_pose_loss #pose_loss + rel_pose_loss + avg_transform_loss + avg_relative_transform_loss #+ avg_relative_pose_token_loss
+            # 融合 token ≈ 幾何組合(prev_global, ΔT_pred) 一致性損失
+            compose_consistency_losses = []
+            for i in range(1, len(preds)):
+                if "relative_pose" not in preds[i]:
+                    continue
+                # 取前一幀全局姿態與當前預測相對姿態
+                # 對前一幀全局姿態做 stop-grad，避免兩側共同遷就造成退化
+                t_prev = pr_poses[i - 1][0].detach()          # (B,3)
+                q_prev = pr_poses[i - 1][1].detach()          # (B,4)
+                rel = preds[i]["relative_pose"]               # (B,7)
+                dt, dq = rel[:, :3], rel[:, 3:]                # (B,3), (B,4)
+
+                # 幾何組合：
+                # t_hat = t_prev + R(q_prev) * dt
+                # q_hat = standardize(dq * q_prev)  # 先应用相对旋转，再应用前一帧旋转
+                t_hat = t_prev + rotate_vector(q_prev, dt)
+                q_hat = standardize_quaternion(quaternion_multiply(dq, q_prev))
+
+                # 當前幀全局預測
+                t_curr, q_curr = pr_poses[i]
+
+                trans_l = torch.norm(t_hat - t_curr, dim=-1).mean()
+                quat_l = torch.norm(q_hat - q_curr, dim=-1).mean() * 40.0
+                compose_consistency_losses.append(trans_l + quat_l)
+
+            if compose_consistency_losses:
+                fusion_compose_consistency = torch.stack(compose_consistency_losses).mean()
+                details["fusion_compose_consistency_loss"] = float(fusion_compose_consistency.item())
+            else:
+                fusion_compose_consistency = torch.tensor(0.0, device=gt_poses[0][0].device)
+
+            total_loss = pose_loss + avg_relative_pose_token_loss #+ fusion_compose_consistency
             
             return total_loss, details
 

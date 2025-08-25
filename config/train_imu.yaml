@@ -35,8 +35,8 @@ pretrained: cut3r_512_dpt_4_64.pth
 load_only_encoder: False
 
 # Training configuration
-long_context: True
-fixed_length: False
+long_context: False
+fixed_length: True
 resume: null
 benchmark: False
 
@@ -60,14 +60,14 @@ test_dataset: 40 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti',
 
 seed: 0
 batch_size: 2
-accum_iter: 4
+accum_iter: 1
 gradient_checkpointing: False
-epochs: 10
+epochs: 100
 start_epoch: 0
 weight_decay: 0.05
-lr: 1e-6
-min_lr: 1e-7
-warmup_epochs: 0.5
+lr: 1e-4
+min_lr: 1e-6
+warmup_epochs: 10.0
 amp: 1
 
 num_workers: 8
@@ -79,9 +79,9 @@ gpu: 0
 distributed: True
 dist_backend: 'nccl'
 
-eval_freq: 1
-save_freq: 1
-keep_freq: 1
+eval_freq: 10
+save_freq: 10
+keep_freq: 10
 print_freq: 10
 print_img_freq: 50000000
 num_imgs_vis: 4

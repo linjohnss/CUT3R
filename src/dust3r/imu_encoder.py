@@ -6,7 +6,7 @@ import math
 
 # Import for proper output format
 from dust3r.model import ARCroco3DStereoOutput
-from dust3r.utils.camera import Mlp
+from dust3r.utils.camera import Mlp, quaternion_multiply, rotate_vector, standardize_quaternion
 
 class IMUEncoder(nn.Module):
     """
@@ -167,6 +167,15 @@ class CUT3RIMU(nn.Module):
         ).to(device)
         # 新增 relative pose decoder
         self.relative_pose_decoder = RelativePoseDecoder(hidden_size=cut3r_model.dec_embed_dim).to(device)
+        # 新增 pose encoder：將 7D 相機姿態和當前圖像特徵編碼回 latent token 維度
+        # 輸入：7D camera pose + 圖像特徵維度
+        pose_encoder_input_dim = 7 + cut3r_model.enc_embed_dim
+        self.pose_encoder = Mlp(
+            in_features=pose_encoder_input_dim,
+            hidden_features=int(cut3r_model.dec_embed_dim * 4.0),
+            out_features=cut3r_model.dec_embed_dim,
+            drop=imu_config.get('dropout', 0.1),
+        ).to(device)
         # 新增 transformer fusion 融合 pose token
         self.pose_token_transformer = nn.TransformerEncoderLayer(
             d_model=cut3r_model.dec_embed_dim,
@@ -194,7 +203,7 @@ class CUT3RIMU(nn.Module):
         """Reset sequence-specific state variables"""
         self.prev_pose_token = None
         self.feat_i_prev = None
-        self.prev_camera_pose = None
+        self.prev_camera_pose = None  # (trans: (B,3), quat: (B,4))
 
         # 基礎模型狀態
         self.state_feat = None
@@ -248,8 +257,9 @@ class CUT3RIMU(nn.Module):
         """
         IMU-enhanced decoder step with new stateless relative pose retriever
         """        
-        # 初始化 relative_pose 變量
+        # 初始化 relative_pose 與累積的 camera_pose 變量
         relative_pose = None
+        camera_pose_curr = None
         
         if self.pose_head_flag:
             global_img_feat_i = self.cut3r_model._get_img_level_feat(feat_i)
@@ -257,6 +267,17 @@ class CUT3RIMU(nn.Module):
                 pose_feat_i = self.cut3r_model.pose_token.expand(feat_i.shape[0], -1, -1)
                 self.prev_pose_token = None
                 relative_pose_token = None
+                # 初始化第0帧为identity pose
+                B = feat_i.shape[0]
+                device = feat_i.device
+                dtype = feat_i.dtype
+                current_t = torch.zeros(B, 3, device=device, dtype=dtype)
+                current_q = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device, dtype=dtype).expand(B, -1)
+                # 确保初始四元数被标准化
+                current_q = standardize_quaternion(current_q)
+                camera_pose_curr = torch.cat([current_t, current_q], dim=-1)
+                # 保存当前状态作为下一帧的prev状态
+                self.prev_camera_pose = (current_t, current_q)
             else:
                 imu_data = views[i]['imu']  # (seq_len, 6)
                 imu_feat = self.imu_encoder(imu_data)  # (batch_size, embed_dim)                
@@ -289,6 +310,30 @@ class CUT3RIMU(nn.Module):
                     pose_feat_i = relative_pose_token.unsqueeze(1)  # (B, 1, token_dim)
                 
                 relative_pose = self.relative_pose_decoder(relative_pose_token)
+                
+                # 标准化相对位姿的四元数部分，确保数值稳定性
+                rel_t = relative_pose[:, :3]
+                rel_q = relative_pose[:, 3:]
+                rel_q = standardize_quaternion(rel_q)
+                
+                # 获取前一帧的相机姿态
+                prev_t, prev_q = self.prev_camera_pose
+                
+                # 按照checkpoint文件中的正确算法进行pose累加：
+                
+                # 1. 四元数累加：先应用相对旋转，再应用前一帧的旋转
+                # 这与checkpoint文件中的实现保持一致：current_quat = quaternion_multiply(rel_quat, current_quat)
+                q_curr = standardize_quaternion(quaternion_multiply(rel_q, prev_q))
+                
+                # 2. 平移累加：相对平移需要先转换到世界坐标系
+                # 使用前一帧的quaternion来旋转相对平移
+                rotated_rel_t = rotate_vector(prev_q, rel_t)
+                t_curr = prev_t + rotated_rel_t
+                
+                # 3. 更新状态
+                self.prev_camera_pose = (t_curr, q_curr)
+                # 当前帧camera pose（B,7）
+                camera_pose_curr = torch.cat([t_curr, q_curr], dim=-1).detach()
 
             pose_pos_i = -torch.ones(
                 feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
@@ -310,6 +355,18 @@ class CUT3RIMU(nn.Module):
             reset_mask=views[i]["reset"],
             update=views[i].get("update", None),
         )
+
+        # # 使用累加後的 camera pose 和當前圖像特徵經由 pose encoder 產生的 token，覆蓋 decoder 的 pose token
+        # if camera_pose_curr is not None:
+        #     # 獲取當前圖像特徵的全局表示
+        #     global_img_feat_i = self.cut3r_model._get_img_level_feat(feat_i)
+        #     if global_img_feat_i.dim() == 3:
+        #         global_img_feat_i = global_img_feat_i.squeeze(1)  # (B, img_feat_dim)
+            
+        #     # 將 camera pose 和圖像特徵拼接作為 pose encoder 的輸入
+        #     pose_encoder_input = torch.cat([camera_pose_curr, global_img_feat_i], dim=-1)  # (B, 7+img_feat_dim)
+        #     pose_token_from_cam = self.pose_encoder(pose_encoder_input).unsqueeze(1)  # (B,1,token_dim)
+        #     dec[-1][:, 0:1] = pose_token_from_cam
 
         # 從 decoder 輸出中提取更新後的 pose token
         out_pose_feat_i = dec[-1][:, 0:1]  # 使用 rollout 後的 pose token
@@ -344,11 +401,11 @@ class CUT3RIMU(nn.Module):
         if i < len(views) - 1:
             self.feat_i_prev = feat_i
         
-        # 將 relative_pose 加入 res 字典，供 loss 使用
+        # 僅將 relative_pose 與 tmp_camera_pose 加入 res，camera_pose 由 predict head 輸出
         if relative_pose is not None:
             res["relative_pose"] = relative_pose
-        else:
-            pass
+        if camera_pose_curr is not None:
+            res["camera_pose"] = camera_pose_curr
 
         return res, (state_feat, mem)
     

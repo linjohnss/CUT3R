@@ -166,6 +166,14 @@ def freeze_parameters_for_imu_training(model):
             relative_pose_decoder_params += 1
         printer.info(f"Unfroze {relative_pose_decoder_params} relative pose decoder parameters")
     
+    # Unfreeze pose encoder (encode 7D camera pose back to latent token)
+    pose_encoder_params = 0
+    if hasattr(model, 'pose_encoder'):
+        for param in model.pose_encoder.parameters():
+            param.requires_grad = True
+            pose_encoder_params += 1
+        printer.info(f"Unfroze {pose_encoder_params} pose encoder parameters")
+    
     # Unfreeze pose token transformer
     pose_token_transformer_params = 0
     if hasattr(model, 'pose_token_transformer'):
@@ -190,15 +198,18 @@ def freeze_parameters_for_imu_training(model):
             original_pose_retriever_params += 1
         printer.info(f"Explicitly froze {original_pose_retriever_params} original pose retriever parameters")
 
-    
-    # Unfreeze LoRA parameters in the wrapped CUT3R model
+    # Unfreeze LoRA parameters ONLY if LoRA training is enabled
+    # Note: This should be controlled by the training configuration
     lora_params = 0
     if hasattr(model, 'cut3r_model'):
         for name, param in model.cut3r_model.named_parameters():
             if 'lora_A' in name or 'lora_B' in name:
-                param.requires_grad = True
+                # Only unfreeze LoRA if it's explicitly enabled in training mode
+                # This will be controlled by the calling function based on args.training_mode.enable_lora
+                param.requires_grad = False  # Default to frozen
                 lora_params += 1
-    printer.info(f"Unfroze {lora_params} LoRA parameters")
+    if lora_params > 0:
+        printer.info(f"Found {lora_params} LoRA parameters (currently frozen - will be controlled by training mode)")
     
     # Count total trainable parameters
     total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -220,6 +231,9 @@ def freeze_parameters_for_imu_training(model):
     if hasattr(model, 'relative_pose_decoder'):
         rel_dec_trainable = sum(p.numel() for p in model.relative_pose_decoder.parameters() if p.requires_grad)
         printer.info(f"  - Relative Pose Decoder: {rel_dec_trainable:,} parameters")
+    if hasattr(model, 'pose_encoder'):
+        pose_enc_trainable = sum(p.numel() for p in model.pose_encoder.parameters() if p.requires_grad)
+        printer.info(f"  - Pose Encoder: {pose_enc_trainable:,} parameters")
     
     if hasattr(model, 'pose_token_transformer'):
         pose_trans_trainable = sum(p.numel() for p in model.pose_token_transformer.parameters() if p.requires_grad)
@@ -228,11 +242,6 @@ def freeze_parameters_for_imu_training(model):
     if hasattr(model, 'pose_token_fusion_mlp'):
         pose_mlp_trainable = sum(p.numel() for p in model.pose_token_fusion_mlp.parameters() if p.requires_grad)
         printer.info(f"  - Pose Token Fusion MLP: {pose_mlp_trainable:,} parameters")
-    
-    if lora_params > 0:
-        lora_trainable = sum(p.numel() for name, p in model.cut3r_model.named_parameters() 
-                           if p.requires_grad and ('lora_A' in name or 'lora_B' in name))
-        printer.info(f"  - LoRA: {lora_trainable:,} parameters")
     
     if total_trainable == 0:
         printer.error("❌ NO TRAINABLE PARAMETERS FOUND!")
@@ -435,6 +444,32 @@ def train(args):
     
     # Apply IMU-specific parameter freezing if this is an IMU model
     freeze_parameters_for_imu_training(model)
+    
+    # Handle LoRA parameter training based on training mode
+    enable_lora = getattr(args.training_mode, 'enable_lora', False)
+    if enable_lora and hasattr(model, 'cut3r_model'):
+        printer.info("=== ENABLING LoRA PARAMETER TRAINING ===")
+        lora_trainable_count = 0
+        for name, param in model.cut3r_model.named_parameters():
+            if 'lora_A' in name or 'lora_B' in name:
+                param.requires_grad = True
+                lora_trainable_count += 1
+        printer.info(f"Enabled training for {lora_trainable_count} LoRA parameters")
+        
+        # Recalculate trainable parameters
+        total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        printer.info(f"Updated - Trainable parameters: {total_trainable:,} / {total_params:,} ({total_trainable/total_params*100:.3f}%)")
+        printer.info("=== END LoRA PARAMETER ENABLEMENT ===")
+    elif hasattr(model, 'cut3r_model'):
+        # Ensure LoRA parameters are frozen when LoRA training is disabled
+        lora_frozen_count = 0
+        for name, param in model.cut3r_model.named_parameters():
+            if 'lora_A' in name or 'lora_B' in name:
+                param.requires_grad = False
+                lora_frozen_count += 1
+        if lora_frozen_count > 0:
+            printer.info(f"Ensured {lora_frozen_count} LoRA parameters remain frozen (LoRA training disabled)")
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
@@ -511,6 +546,10 @@ def train(args):
             if hasattr(actual_model, 'relative_pose_decoder'):
                 imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
             
+            # Save pose encoder if it exists
+            if hasattr(actual_model, 'pose_encoder'):
+                imu_state_dict['pose_encoder'] = actual_model.pose_encoder.state_dict()
+            
             # Save pose token transformer if it exists
             if hasattr(actual_model, 'pose_token_transformer'):
                 imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
@@ -572,14 +611,48 @@ def train(args):
             
             printer.info("=== END LORA CHECKPOINT LOADING ===")
         else:
-            # Standard checkpoint loading
-            best_so_far = misc.load_model(
-                args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
-            )
+            # Standard checkpoint loading with optimizer state handling
+            printer.info("=== LOADING STANDARD CHECKPOINT ===")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load model weights
+            model.load_state_dict(checkpoint["model"], strict=False)
+            printer.info("Loaded model weights")
+            
+            # Load optimizer state (skip if parameter groups don't match)
+            if 'optimizer' in checkpoint:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    printer.info("Loaded optimizer state")
+                except Exception as e:
+                    printer.warning(f"Failed to load optimizer state: {e}")
+                    printer.warning("Continuing with fresh optimizer state...")
+            
+            # Load other training state
+            if 'epoch' in checkpoint:
+                args.start_epoch = checkpoint['epoch'] + 1
+                printer.info(f"Resuming from epoch {args.start_epoch}")
+            else:
+                args.start_epoch = 0
+            
+            # Load scaler state
+            if 'scaler' in checkpoint and loss_scaler is not None:
+                try:
+                    loss_scaler.load_state_dict(checkpoint['scaler'])
+                    printer.info("Loaded loss scaler state")
+                except Exception as e:
+                    printer.warning(f"Failed to load loss scaler state: {e}")
+            
+            # Load best_so_far
+            best_so_far = checkpoint.get('best_so_far', float('inf'))
+            printer.info(f"Best loss so far: {best_so_far}")
+            
+            printer.info("=== END STANDARD CHECKPOINT LOADING ===")
     else:
-        best_so_far = misc.load_model(
-            args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
-        )
+        # No checkpoint to resume from
+        args.start_epoch = 0
+        best_so_far = float('inf')
+        printer.info("Starting training from scratch")
     
     if best_so_far is None:
         best_so_far = float("inf")
@@ -720,6 +793,10 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
             # Save relative pose decoder if it exists
             if hasattr(actual_model, 'relative_pose_decoder'):
                 imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
+            
+            # Save pose encoder if it exists
+            if hasattr(actual_model, 'pose_encoder'):
+                imu_state_dict['pose_encoder'] = actual_model.pose_encoder.state_dict()
             
             # Save pose token transformer if it exists
             if hasattr(actual_model, 'pose_token_transformer'):
