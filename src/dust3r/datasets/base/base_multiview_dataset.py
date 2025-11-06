@@ -472,8 +472,13 @@ class BaseMultiViewDataset(EasyDataset):
         # high-quality Lanczos down-scaling
         target_resolution = np.array(resolution)
         if self.aug_crop > 1:
+            # Handle both RandomState and default_rng
+            if hasattr(rng, 'integers'):
+                crop_value = rng.integers(0, self.aug_crop)
+            else:
+                crop_value = rng.randint(0, self.aug_crop)
             target_resolution += (
-                rng.integers(0, self.aug_crop)
+                crop_value
                 if not self.seq_aug_crop
                 else self.delta_target_resolution
             )
@@ -497,9 +502,9 @@ class BaseMultiViewDataset(EasyDataset):
 
 def is_good_type(key, v):
     """returns (is_good, err_msg)"""
-    if isinstance(v, (str, int, tuple)):
+    if isinstance(v, (str, int, tuple, dict)):
         return True, None
-    if v.dtype not in (np.float32, torch.float32, bool, np.int32, np.int64, np.uint8):
+    if hasattr(v, 'dtype') and v.dtype not in (np.float32, torch.float32, bool, np.int32, np.int64, np.uint8):
         return False, f"bad {v.dtype=}"
     return True, None
 

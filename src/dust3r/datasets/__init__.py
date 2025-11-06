@@ -47,12 +47,20 @@ def get_data_loader(
     pin_mem=True,
     accelerator: Accelerator = None,
     fixed_length=False,
+    extra_context=None,
 ):
     import torch
 
     # pytorch dataset
     if isinstance(dataset, str):
-        dataset = eval(dataset)
+        # If extra_context is provided, merge it with globals
+        if extra_context:
+            # Get current module's globals (includes all imported dataset classes)
+            eval_globals = globals().copy()
+            eval_globals.update(extra_context)
+            dataset = eval(dataset, eval_globals)
+        else:
+            dataset = eval(dataset)
 
     try:
         sampler = dataset.make_sampler(

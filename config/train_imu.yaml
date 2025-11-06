@@ -6,29 +6,9 @@ training_mode:
   enable_lora: false         # Disable LoRA training  
   enable_imu: true           # Enable IMU training
   freeze_cut3r: true         # Freeze CUT3R base model (only train IMU components)
-  
-# For other training modes, you can use:
-# 
-# Train ONLY LoRA (no IMU):
-# training_mode:
-#   enable_lora: true
-#   enable_imu: false
-#   freeze_cut3r: true
-#
-# Train both LoRA and IMU:
-# training_mode:
-#   enable_lora: true
-#   enable_imu: true  
-#   freeze_cut3r: true
-#
-# Full model training (no freezing):
-# training_mode:
-#   enable_lora: false
-#   enable_imu: false
-#   freeze_cut3r: false
 
 # Base CUT3R model (modified for IMU-only training)
-model: "ARCroco3DStereo(ARCroco3DStereoConfig(freeze='none', state_size=768, state_pe='2d', pos_embed='RoPE100', rgb_head=True, pose_head=True, patch_embed_cls='ManyAR_PatchEmbed', img_size=(512, 512), head_type='dpt', output_mode='pts3d+pose', depth_mode=('exp', -inf, inf), conf_mode=('exp', 1, inf), pose_mode=('exp', -inf, inf), enc_embed_dim=1024, enc_depth=24, enc_num_heads=16, dec_embed_dim=768, dec_depth=12, dec_num_heads=12, landscape_only=False, enable_lora=False, lora_rank=16, lora_alpha=16.0, lora_dropout=0.0, lora_target_modules=None))"
+model: "ARCroco3DStereo(ARCroco3DStereoConfig(freeze='encoder_and_decoder_head', state_size=768, state_pe='2d', pos_embed='RoPE100', rgb_head=True, pose_head=True, patch_embed_cls='ManyAR_PatchEmbed', img_size=(512, 512), head_type='dpt', output_mode='pts3d+pose', depth_mode=('exp', -inf, inf), conf_mode=('exp', 1, inf), pose_mode=('exp', -inf, inf), enc_embed_dim=1024, enc_depth=24, enc_num_heads=16, dec_embed_dim=768, dec_depth=12, dec_num_heads=12, landscape_only=False, enable_lora=False, lora_rank=16, lora_alpha=16.0, lora_dropout=0.0, lora_target_modules=None))"
 
 # Pretrained model path
 pretrained: cut3r_512_dpt_4_64.pth
@@ -39,9 +19,10 @@ long_context: False
 fixed_length: True
 resume: null
 benchmark: False
+precompute_states: True  # Enable to precompute recurrent states for all scenes before training
 
 # Data configuration (same as finetune_kitti_lora.yaml)
-num_views: 8  # Reduced from 32 for IMU training
+num_views: 4  # Reduced from 32 for IMU training
 num_test_views: 4
 n_corres_train: 0
 n_corres_test: 0
@@ -52,23 +33,28 @@ test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_va
 resolution: [(512, 384)]
 
 allow_repeat: False
-dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, aug_crop=16, resolution=[(512, 384)], transform=SeqColorJitter, num_views=${num_views}, n_corres=${n_corres_train})
+dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, aug_crop=0, resolution=[(512, 384)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, frame_range=(0, 200), demo_compatible=True)
 
 
 train_dataset: 200 @ ${dataset1}
-test_dataset: 40 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+test_dataset: 10 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
 seed: 0
 batch_size: 2
 accum_iter: 1
 gradient_checkpointing: False
-epochs: 100
+epochs: 300
 start_epoch: 0
 weight_decay: 0.05
 lr: 1e-4
 min_lr: 1e-6
 warmup_epochs: 10.0
 amp: 1
+
+imu_lr: 1e-4        # IMU encoder 學習率 (較高，因為是從頭訓練)
+cut3r_lr: 0e-4      # CUT3R 基礎模型學習率 (較低，因為是微調)
+imu_min_lr: 1e-6    # IMU encoder 最小學習率
+cut3r_min_lr: 0e-6  # CUT3R 基礎模型最小學習率
 
 num_workers: 8
 world_size: 1
@@ -103,7 +89,16 @@ lora_target_modules: null  # Use default targets
 imu_config:
   input_dim: 6              # IMU 6-axis (acc + gyro)
   seq_len: 10               # IMU sequence length per frame
-  dropout: 0.1              # IMU encoder dropout
+  dropout: 0.0              # IMU encoder dropout
+
+# Slack notification configuration (NEW - for training notifications)
+slack:
+  enabled: true            # Enable/disable Slack notifications
+  webhook_url: null        # Set via SLACK_WEBHOOK_URL environment variable for security
+  channel: "@John Lin"         # Optional: specific channel to send messages to
+  send_on_completion: true  # Send notification when training completes
+  send_on_error: true       # Send notification when training fails
+  send_epoch_updates: false # Send periodic epoch updates (can be spammy)
 
 # Hydra configuration
 hydra:

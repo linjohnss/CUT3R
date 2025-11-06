@@ -49,6 +49,188 @@ import random
 import builtins
 import shutil
 
+# Import Slack notification utility
+from slack_notification import create_slack_notifier
+
+
+def get_imu_parameter_groups(model, weight_decay, args):
+    """
+    分離 IMU encoder 和 CUT3R 的參數組，為它們設置不同的學習率
+    只將 requires_grad=True 的參數加入優化器，凍結的參數完全排除
+    
+    Args:
+        model: CUT3RIMU model
+        weight_decay: weight decay value
+        args: training arguments
+    
+    Returns:
+        list of parameter groups with different learning rates
+    """
+    # 獲取 IMU 相關的學習率設置
+    imu_lr = getattr(args, 'imu_lr', args.lr)  # 默認使用主學習率
+    cut3r_lr = getattr(args, 'cut3r_lr', args.lr)  # 默認使用主學習率
+    
+    parameter_groups = []
+    
+    # 分離 IMU encoder 參數和 CUT3R 參數
+    imu_params = []
+    cut3r_params = []
+    frozen_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            # All frozen parameters (should be CUT3R parameters)
+            frozen_params.append((name, param.numel()))
+            continue  # 跳過凍結的參數，不加入優化器
+            
+        # 判斷是否為 IMU 相關參數
+        # CRITICAL FIX: Only include parameters that are actually trainable (requires_grad=True)
+        # and belong to IMU components
+        # IMPORTANT: Include relative_pose_token which is a learnable parameter for relative pose estimation
+        if any(imu_keyword in name for imu_keyword in ['imu_encoder', 'pose_transformer', 'relative_pose_decoder', 'relative_pose_token']):
+            imu_params.append((name, param))
+        else:
+            # This should not happen if CUT3R parameters are properly frozen
+            print(f"WARNING: Found trainable parameter that is not IMU-related: {name}")
+            cut3r_params.append((name, param))
+    
+    # 統計信息
+    total_frozen_params = sum(count for _, count in frozen_params)
+    total_imu_params = sum(p.numel() for _, p in imu_params)
+    total_cut3r_params = sum(p.numel() for _, p in cut3r_params)
+    
+    print(f"Parameter Statistics:")
+    print(f"  Frozen parameters: {total_frozen_params:,} (not included in optimizer)")
+    print(f"  IMU parameters: {total_imu_params:,}")
+    print(f"  CUT3R parameters: {total_cut3r_params:,}")
+    print(f"  Total trainable: {total_imu_params + total_cut3r_params:,}")
+    
+    # 只為 IMU 參數創建參數組（CUT3R 參數如果被凍結則不加入優化器）
+    if imu_params:
+        # 分離 bias 和 norm 層（設置 weight_decay=0）
+        imu_decay_params = []
+        imu_no_decay_params = []
+        
+        for name, param in imu_params:
+            if len(param.shape) == 1 or param.dim() == 1:  # bias 和 norm 層
+                imu_no_decay_params.append(param)
+            else:
+                imu_decay_params.append(param)
+        
+        if imu_decay_params:
+            parameter_groups.append({
+                'params': imu_decay_params,
+                'lr': imu_lr,
+                'weight_decay': weight_decay,
+                'name': 'imu_decay'
+            })
+        
+        if imu_no_decay_params:
+            parameter_groups.append({
+                'params': imu_no_decay_params,
+                'lr': imu_lr,
+                'weight_decay': 0.0,
+                'name': 'imu_no_decay'
+            })
+    
+    # 只為未凍結的 CUT3R 參數創建參數組
+    if cut3r_params:
+        # 分離 bias 和 norm 層（設置 weight_decay=0）
+        cut3r_decay_params = []
+        cut3r_no_decay_params = []
+        
+        for name, param in cut3r_params:
+            if len(param.shape) == 1 or param.dim() == 1:  # bias 和 norm 層
+                cut3r_no_decay_params.append(param)
+            else:
+                cut3r_decay_params.append(param)
+        
+        if cut3r_decay_params:
+            parameter_groups.append({
+                'params': cut3r_decay_params,
+                'lr': cut3r_lr,
+                'weight_decay': weight_decay,
+                'name': 'cut3r_decay'
+            })
+        
+        if cut3r_no_decay_params:
+            parameter_groups.append({
+                'params': cut3r_no_decay_params,
+                'lr': cut3r_lr,
+                'weight_decay': 0.0,
+                'name': 'cut3r_no_decay'
+            })
+    
+    # 打印參數組信息
+    print("\nOptimizer parameter groups:")
+    for i, group in enumerate(parameter_groups):
+        param_count = sum(p.numel() for p in group['params'])
+        print(f"  Group {i}: {group['name']} - LR: {group['lr']:.2e}, WD: {group['weight_decay']}, Params: {param_count:,}")
+    
+    # 驗證沒有凍結的參數被意外加入優化器
+    optimizer_param_count = sum(sum(p.numel() for p in group['params']) for group in parameter_groups)
+    expected_trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    if optimizer_param_count != expected_trainable_count:
+        print(f"⚠️  Warning: Parameter count mismatch!")
+        print(f"   Optimizer params: {optimizer_param_count:,}")
+        print(f"   Expected trainable: {expected_trainable_count:,}")
+    else:
+        print(f"✅ All trainable parameters ({optimizer_param_count:,}) correctly included in optimizer")
+    
+    return parameter_groups
+
+
+def adjust_imu_learning_rate(optimizer, epoch, args):
+    """
+    為分離的參數組調整學習率
+    支持 IMU encoder 和 CUT3R 的不同學習率調度
+    只調整優化器中實際存在的參數組
+    """
+    # 獲取分離的學習率設置
+    imu_lr = getattr(args, 'imu_lr', args.lr)
+    cut3r_lr = getattr(args, 'cut3r_lr', args.lr)
+    imu_min_lr = getattr(args, 'imu_min_lr', args.min_lr)
+    cut3r_min_lr = getattr(args, 'cut3r_min_lr', args.min_lr)
+    
+    # 計算 warmup 和 decay 後的學習率
+    if epoch < args.warmup_epochs:
+        # Warmup 階段
+        imu_current_lr = imu_lr * epoch / args.warmup_epochs
+        cut3r_current_lr = cut3r_lr * epoch / args.warmup_epochs
+    else:
+        # Cosine decay 階段
+        imu_current_lr = imu_min_lr + (imu_lr - imu_min_lr) * 0.5 * (
+            1.0 + math.cos(
+                math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)
+            )
+        )
+        cut3r_current_lr = cut3r_min_lr + (cut3r_lr - cut3r_min_lr) * 0.5 * (
+            1.0 + math.cos(
+                math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)
+            )
+        )
+    
+    # 統計實際調整的參數組
+    imu_groups_updated = 0
+    cut3r_groups_updated = 0
+    
+    # 為每個參數組設置對應的學習率
+    for param_group in optimizer.param_groups:
+        group_name = param_group.get('name', '')
+        if 'imu' in group_name:
+            param_group['lr'] = imu_current_lr
+            imu_groups_updated += 1
+        elif 'cut3r' in group_name:
+            param_group['lr'] = cut3r_current_lr
+            cut3r_groups_updated += 1
+        else:
+            # 如果沒有指定名稱，使用默認學習率（通常是IMU學習率）
+            param_group['lr'] = imu_current_lr
+            print(f"⚠️  Warning: Parameter group without name found, using IMU learning rate: {imu_current_lr:.2e}")
+    return imu_current_lr, cut3r_current_lr
+
+
 from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.logging import get_logger
@@ -123,133 +305,6 @@ def create_imu_enhanced_model(base_model, imu_config):
         return base_model
 
 
-def freeze_parameters_for_imu_training(model):
-    """
-    Freeze parameters for new IMU training with IMUAwarePoseRetriever:
-    - Keep CUT3R frozen (except LoRA if enabled)
-    - Train IMU encoder
-    - Train NEW IMUAwarePoseRetriever
-    - FREEZE original pose_retriever
-    - Train LoRA parameters if enabled
-    """
-    if not hasattr(model, 'imu_encoder'):
-        # Not an IMU model, don't change anything
-        printer.info("Not an IMU model, skipping parameter freezing")
-        return
-    
-    printer.info("=== IMU PARAMETER FREEZING ===")
-    
-    # First freeze everything
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    # Unfreeze IMU encoder
-    imu_encoder_params = 0
-    for param in model.imu_encoder.parameters():
-        param.requires_grad = True
-        imu_encoder_params += 1
-    printer.info(f"Unfroze {imu_encoder_params} IMU encoder parameters")
-    
-    # Unfreeze NEW IMU-aware pose retriever
-    imu_pose_retriever_params = 0
-    if hasattr(model, 'imu_pose_retriever'):
-        for param in model.imu_pose_retriever.parameters():
-            param.requires_grad = True
-            imu_pose_retriever_params += 1
-        printer.info(f"Unfroze {imu_pose_retriever_params} IMU pose retriever parameters")
-    
-    # Unfreeze relative pose decoder
-    relative_pose_decoder_params = 0
-    if hasattr(model, 'relative_pose_decoder'):
-        for param in model.relative_pose_decoder.parameters():
-            param.requires_grad = True
-            relative_pose_decoder_params += 1
-        printer.info(f"Unfroze {relative_pose_decoder_params} relative pose decoder parameters")
-    
-    # Unfreeze pose encoder (encode 7D camera pose back to latent token)
-    pose_encoder_params = 0
-    if hasattr(model, 'pose_encoder'):
-        for param in model.pose_encoder.parameters():
-            param.requires_grad = True
-            pose_encoder_params += 1
-        printer.info(f"Unfroze {pose_encoder_params} pose encoder parameters")
-    
-    # Unfreeze pose token transformer
-    pose_token_transformer_params = 0
-    if hasattr(model, 'pose_token_transformer'):
-        for param in model.pose_token_transformer.parameters():
-            param.requires_grad = True
-            pose_token_transformer_params += 1
-        printer.info(f"Unfroze {pose_token_transformer_params} pose token transformer parameters")
-    
-    # Unfreeze pose token fusion MLP
-    pose_token_fusion_mlp_params = 0
-    if hasattr(model, 'pose_token_fusion_mlp'):
-        for param in model.pose_token_fusion_mlp.parameters():
-            param.requires_grad = True
-            pose_token_fusion_mlp_params += 1
-        printer.info(f"Unfroze {pose_token_fusion_mlp_params} pose token fusion MLP parameters")
-    
-    # EXPLICITLY freeze original pose retriever
-    original_pose_retriever_params = 0
-    if hasattr(model, 'cut3r_model') and hasattr(model.cut3r_model, 'pose_retriever'):
-        for param in model.cut3r_model.pose_retriever.parameters():
-            param.requires_grad = False
-            original_pose_retriever_params += 1
-        printer.info(f"Explicitly froze {original_pose_retriever_params} original pose retriever parameters")
-
-    # Unfreeze LoRA parameters ONLY if LoRA training is enabled
-    # Note: This should be controlled by the training configuration
-    lora_params = 0
-    if hasattr(model, 'cut3r_model'):
-        for name, param in model.cut3r_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name:
-                # Only unfreeze LoRA if it's explicitly enabled in training mode
-                # This will be controlled by the calling function based on args.training_mode.enable_lora
-                param.requires_grad = False  # Default to frozen
-                lora_params += 1
-    if lora_params > 0:
-        printer.info(f"Found {lora_params} LoRA parameters (currently frozen - will be controlled by training mode)")
-    
-    # Count total trainable parameters
-    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    
-    printer.info(f"Total parameters: {total_params:,}")
-    printer.info(f"Trainable parameters: {total_trainable:,}")
-    printer.info(f"Trainable ratio: {total_trainable/total_params*100:.3f}%")
-    
-    # Breakdown of trainable parameters
-    if hasattr(model, 'imu_encoder'):
-        imu_enc_trainable = sum(p.numel() for p in model.imu_encoder.parameters() if p.requires_grad)
-        printer.info(f"  - IMU Encoder: {imu_enc_trainable:,} parameters")
-    
-    if hasattr(model, 'imu_pose_retriever'):
-        imu_ret_trainable = sum(p.numel() for p in model.imu_pose_retriever.parameters() if p.requires_grad)
-        printer.info(f"  - IMU Pose Retriever: {imu_ret_trainable:,} parameters")
-    
-    if hasattr(model, 'relative_pose_decoder'):
-        rel_dec_trainable = sum(p.numel() for p in model.relative_pose_decoder.parameters() if p.requires_grad)
-        printer.info(f"  - Relative Pose Decoder: {rel_dec_trainable:,} parameters")
-    if hasattr(model, 'pose_encoder'):
-        pose_enc_trainable = sum(p.numel() for p in model.pose_encoder.parameters() if p.requires_grad)
-        printer.info(f"  - Pose Encoder: {pose_enc_trainable:,} parameters")
-    
-    if hasattr(model, 'pose_token_transformer'):
-        pose_trans_trainable = sum(p.numel() for p in model.pose_token_transformer.parameters() if p.requires_grad)
-        printer.info(f"  - Pose Token Transformer: {pose_trans_trainable:,} parameters")
-    
-    if hasattr(model, 'pose_token_fusion_mlp'):
-        pose_mlp_trainable = sum(p.numel() for p in model.pose_token_fusion_mlp.parameters() if p.requires_grad)
-        printer.info(f"  - Pose Token Fusion MLP: {pose_mlp_trainable:,} parameters")
-    
-    if total_trainable == 0:
-        printer.error("❌ NO TRAINABLE PARAMETERS FOUND!")
-        raise RuntimeError("No trainable parameters found after IMU parameter freezing")
-    
-    printer.info("=== END IMU PARAMETER FREEZING ===")
-
-
 def train(args):
 
     accelerator = Accelerator(
@@ -264,6 +319,21 @@ def train(args):
 
     setup_for_distributed(accelerator)
 
+    # Initialize Slack notifier
+    slack_config = getattr(args, 'slack', {})
+    slack_enabled = slack_config.get('enabled', False)
+    
+    if slack_enabled:
+        slack_notifier = create_slack_notifier(args)
+        if slack_notifier.enabled:
+            printer.info("Slack notifications enabled")
+        else:
+            printer.info("Slack notifications disabled (no webhook URL provided)")
+            slack_notifier = None
+    else:
+        printer.info("Slack notifications disabled (disabled in config)")
+        slack_notifier = None
+
     printer.info("output_dir: " + args.output_dir)
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -272,10 +342,10 @@ def train(args):
         dst_dir = save_current_code(outdir=args.output_dir)
         printer.info(f"Saving current code to {dst_dir}")
 
-    # auto resume
-    if not args.resume:
-        last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
-        args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
+    # # auto resume
+    # if not args.resume:
+    #     last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
+    #     args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
 
     printer.info("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
 
@@ -289,16 +359,149 @@ def train(args):
     random.seed(seed)
     cudnn.benchmark = args.benchmark
 
-    # training dataset and loader
+    # model - Load model BEFORE dataset to enable state precomputation
+    printer.info("Loading model: %s", args.model)
+    base_model: PreTrainedModel = eval(args.model)
+    
+    # Create IMU-enhanced model if IMU config is provided
+    imu_config = getattr(args, 'imu_config', None)
+    model = create_imu_enhanced_model(base_model, imu_config)
+    printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
+    
+    # Load pretrained weights if available (before state precomputation)
+    if args.pretrained and not args.resume:
+        from dust3r.model import strip_module
+        
+        printer.info(f"Loading pretrained: {args.pretrained}")
+        ckpt = torch.load(args.pretrained, map_location=device)
+        load_only_encoder = getattr(args, "load_only_encoder", False)
+        
+        # Get base model (unwrap if it's CUT3RIMU)
+        base_m = model.cut3r_model if hasattr(model, 'cut3r_model') else model
+        
+        if load_only_encoder:
+            printer.info("Loading only encoder weights...")
+            # Filter to only encoder keys
+            if "model" in ckpt:
+                state_dict = ckpt["model"]
+            else:
+                state_dict = ckpt
+            
+            # Strip module prefix if present
+            state_dict = strip_module(state_dict)
+            
+            filtered_state_dict = {
+                k: v for k, v in state_dict.items()
+                if "enc_blocks" in k or "patch_embed" in k
+            }
+            msg = base_m.load_state_dict(filtered_state_dict, strict=False)
+            printer.info(f"Loaded encoder weights: {msg}")
+        else:
+            # Load full model
+            if "model" in ckpt:
+                state_dict = ckpt["model"]
+            else:
+                state_dict = ckpt
+            msg = base_m.load_state_dict(strip_module(state_dict), strict=False)
+            printer.info(f"Loaded pretrained weights: {msg}")
+    
+    # Move model to device for state precomputation
+    model.to(device)
+    
+    # training dataset and loader (with state precomputation enabled)
     printer.info("Building train dataset %s", args.train_dataset)
-    #  dataset and loader
+    precompute_states = getattr(args, 'precompute_states', False)
+    printer.info(f"precompute_states = {precompute_states}")
+    printer.info(f"args.train_dataset = {args.train_dataset}")
+    printer.info(f"args.train_dataset type = {type(args.train_dataset)}")
+    printer.info(f"args.train_dataset repr = {repr(args.train_dataset)}")
+    
+    # Debug: Check if it's a list or string
+    if isinstance(args.train_dataset, list):
+        printer.info(f"args.train_dataset is a list with {len(args.train_dataset)} items")
+        for i, item in enumerate(args.train_dataset):
+            printer.info(f"  Item {i}: {item} (type: {type(item)})")
+    elif isinstance(args.train_dataset, str):
+        printer.info(f"args.train_dataset is a string with length {len(args.train_dataset)}")
+    else:
+        printer.info(f"args.train_dataset is {type(args.train_dataset)}: {args.train_dataset}")
+    
+    # Prepare extra context for dataset creation
+    extra_context = {}
+    train_dataset_str = args.train_dataset
+    
+    if precompute_states:
+        printer.info("State precomputation enabled - injecting model into dataset")
+        printer.info(f"Original train_dataset_str: {train_dataset_str}")
+        printer.info(f"train_dataset_str type: {type(train_dataset_str)}")
+        printer.info(f"train_dataset_str repr: {repr(train_dataset_str)}")
+        # Add model to extra context for eval()
+        extra_context['model'] = model
+        
+        # Inject precompute parameters into dataset string
+        # Handle the case where train_dataset is "200 @ KITTI_Multi(...)"
+        if 'precompute_model=' not in train_dataset_str:
+            # Check if it's a repeated dataset format (look for " @ KITTI_Multi")
+            if ' @ KITTI_Multi(' in train_dataset_str:
+                printer.info("Found repeated dataset format")
+                # Extract the base dataset string (split only on first @)
+                parts = train_dataset_str.split(' @ ', 1)
+                printer.info(f"Split parts: {parts}")
+                if len(parts) == 2:
+                    count, base_dataset = parts
+                    printer.info(f"Count: {count}, Base dataset: {base_dataset}")
+                    # Inject precompute parameters into the base dataset
+                    insert_pos = base_dataset.rfind(')')
+                    printer.info(f"Insert position: {insert_pos}")
+                    if insert_pos > 0:
+                        modified_base = (
+                            base_dataset[:insert_pos] + 
+                            f", precompute_model=model, precompute_device='{device}'" + 
+                            base_dataset[insert_pos:]
+                        )
+                        train_dataset_str = f"{count} @ {modified_base}"
+                        printer.info(f"✅ Modified dataset string for state precomputation")
+                        printer.info(f"  Original: {args.train_dataset[:100]}...")
+                        printer.info(f"  Modified: {train_dataset_str[:100]}...")
+                    else:
+                        printer.warning(f"⚠️ Could not find ')' in base dataset: {base_dataset}")
+                else:
+                    printer.warning(f"⚠️ Could not split dataset string into 2 parts: {parts}")
+            else:
+                printer.info("Not a repeated dataset format, checking for direct KITTI_Multi")
+                # Direct dataset string (look for KITTI_Multi)
+                if 'KITTI_Multi(' in train_dataset_str:
+                    printer.info("Found direct KITTI_Multi format")
+                    insert_pos = train_dataset_str.rfind(')')
+                    printer.info(f"Insert position: {insert_pos}")
+                    if insert_pos > 0:
+                        train_dataset_str = (
+                            train_dataset_str[:insert_pos] + 
+                            f", precompute_model=model, precompute_device='{device}'" + 
+                            train_dataset_str[insert_pos:]
+                        )
+                        printer.info(f"✅ Modified dataset string for state precomputation")
+                        printer.info(f"  Original: {args.train_dataset[:100]}...")
+                        printer.info(f"  Modified: {train_dataset_str[:100]}...")
+                    else:
+                        printer.warning(f"⚠️ Could not find ')' in dataset string: {train_dataset_str}")
+                else:
+                    printer.warning(f"⚠️ Could not find KITTI_Multi in dataset string: {train_dataset_str[:100]}...")
+        else:
+            printer.info("precompute_model already present in dataset string")
+    
+    # Final check
+    printer.info(f"Final train_dataset_str: {train_dataset_str}")
+    printer.info(f"Contains precompute_model: {'precompute_model=' in train_dataset_str}")
+    
     data_loader_train = build_dataset(
-        args.train_dataset,
+        train_dataset_str,
         args.batch_size,
         args.num_workers,
         accelerator=accelerator,
         test=False,
-        fixed_length=args.fixed_length
+        fixed_length=args.fixed_length,
+        extra_context=extra_context
     )
     printer.info("Building test dataset %s", args.test_dataset)
     data_loader_test = {
@@ -312,58 +515,15 @@ def train(args):
         )
         for dataset in args.test_dataset.split("+")
     }
-
-    # model
-    printer.info("Loading model: %s", args.model)
-    base_model: PreTrainedModel = eval(args.model)
     
-    # Create IMU-enhanced model if IMU config is provided
-    imu_config = getattr(args, 'imu_config', None)
-    model = create_imu_enhanced_model(base_model, imu_config)
-    
-    # Check LoRA configuration (access through base_model for IMU models)
-    actual_model = model.cut3r_model if hasattr(model, 'cut3r_model') else model
-    enable_lora = getattr(args.training_mode, 'enable_lora', False)
-    
-    if enable_lora and getattr(actual_model, 'config', None) and getattr(actual_model.config, 'enable_lora', False):
-        printer.info("=== LoRA MODEL ANALYSIS ===")
-        cfg = actual_model.config
-        printer.info(f"LoRA enabled: {cfg.enable_lora}, rank: {cfg.lora_rank}, alpha: {cfg.lora_alpha}, dropout: {cfg.lora_dropout}")
-
-        lora_layers = [name for name, module in actual_model.named_modules() if 'LoRA' in str(type(module))]
-        if lora_layers:
-            printer.info(f"✅ LoRA successfully applied to {len(lora_layers)} layers")
-            for name in lora_layers:
-                printer.info(f"Found LoRA layer: {name}")
-        else:
-            printer.warning("❌ NO LoRA LAYERS FOUND! This means LoRA was not applied correctly.")
-            printer.warning("The model will train normally but won't generate LoRA weights.")
-            # Show up to 10 Linear layer names for debugging
-            linear_names = [name for name, module in actual_model.named_modules() if isinstance(module, torch.nn.Linear)]
-            printer.info("Sample linear layer names in model: " + ", ".join(linear_names[:10]))
-        printer.info("=== END LoRA ANALYSIS ===")
-    elif enable_lora:
-        printer.warning("LoRA training enabled but model does not support LoRA!")
-    else:
-        printer.info("LoRA training disabled")
-    
-    printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
-    printer.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    # Handle parameter counting for both regular and IMU models
-    if hasattr(model, 'cut3r_model'):
-        # IMU-enhanced model
-        printer.info(f"CUT3R encoder parameters: {sum(p.numel() for p in model.cut3r_model.enc_blocks.parameters())}")
-        printer.info(f"CUT3R decoder parameters: {sum(p.numel() for p in model.cut3r_model.dec_blocks.parameters())}")
-        if hasattr(model, 'imu_encoder'):
-            printer.info(f"IMU encoder parameters: {sum(p.numel() for p in model.imu_encoder.parameters())}")
-        if hasattr(model, 'imu_weight') and hasattr(model, 'pose_weight'):
-            weight_params = model.imu_weight.numel() + model.pose_weight.numel()
-            printer.info(f"IMU fusion weight parameters: {weight_params:,}")
-    else:
-        # Regular model
-        printer.info(f"Encoder parameters: {sum(p.numel() for p in model.enc_blocks.parameters())}")
-        printer.info(f"Decoder parameters: {sum(p.numel() for p in model.dec_blocks.parameters())}")
+    # Handle both wrapped (CUT3RIMU) and unwrapped models
+    base_model = model.cut3r_model if hasattr(model, 'cut3r_model') else model
+    printer.info(
+        f"Encoder parameters: {sum(p.numel() for p in base_model.enc_blocks.parameters())}"
+    )
+    printer.info(
+        f"Decoder parameters: {sum(p.numel() for p in base_model.dec_blocks.parameters())}"
+    )
 
     printer.info(f">> Creating train criterion = {args.train_criterion}")
     train_criterion = eval(args.train_criterion).to(device)
@@ -372,108 +532,26 @@ def train(args):
     )
     test_criterion = eval(args.test_criterion or args.criterion).to(device)
 
-    model.to(device)
+    # Model already moved to device earlier for state precomputation
+    # model.to(device)
 
     if args.gradient_checkpointing:
-        # Check if this is LoRA or frozen training
-        enable_lora = getattr(args.training_mode, 'enable_lora', False)
-        freeze_cut3r = getattr(args.training_mode, 'freeze_cut3r', True)
-        
-        if (enable_lora or freeze_cut3r) and getattr(args.training_mode, 'freeze_cut3r', True):
-            # FORCE disable gradient checkpointing for frozen/LoRA training
-            # Gradient checkpointing is incompatible with frozen parameters
-            printer.warning("⚠️  FORCE disabling gradient checkpointing for frozen parameter training")
-            printer.warning("   Gradient checkpointing conflicts with frozen parameters in LoRA/selective training mode")
-            args.gradient_checkpointing = False
-            # Also disable on model
-            if hasattr(model, 'gradient_checkpointing'):
-                model.gradient_checkpointing = False
-        else:
-            printer.info("Enabling gradient checkpointing for full model training")
-            model.gradient_checkpointing_enable()
-    else:
-        printer.info("Gradient checkpointing disabled")
-        # Ensure it's disabled on model too
-        if hasattr(model, 'gradient_checkpointing'):
-            model.gradient_checkpointing = False
-    
+        # Handle both wrapped (CUT3RIMU) and unwrapped models
+        base_model = model.cut3r_model if hasattr(model, 'cut3r_model') else model
+        base_model.gradient_checkpointing_enable()
     if args.long_context:
-        model.fixed_input_length = False
+        # Handle both wrapped (CUT3RIMU) and unwrapped models
+        base_model = model.cut3r_model if hasattr(model, 'cut3r_model') else model
+        base_model.fixed_input_length = False
 
-    # Handle LoRA and pretrained loading - work with the base model
-    target_model = model.cut3r_model if hasattr(model, 'cut3r_model') else model
-    enable_lora = getattr(args.training_mode, 'enable_lora', False)
-    
-    # Load pretrained weights FIRST (before applying LoRA if enabled)
-    if args.pretrained and not args.resume:
-        printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
-        load_only_encoder = getattr(args, "load_only_encoder", False)
-        state_dict = ckpt["model"]
-        if load_only_encoder:
-            state_dict = {k: v for k, v in state_dict.items() if "enc_blocks" in k or "patch_embed" in k}
-        
-        # Actually load the state dict to the base model
-        printer.info(
-            target_model.load_state_dict(strip_module(state_dict), strict=False)
-        )
-        del ckpt
-    
-    # Apply LoRA if enabled and configured
-    if enable_lora and getattr(target_model, '_lora_config', None):
-        lora_config = target_model._lora_config
-        printer.info(f"=== APPLYING LORA TO MODEL ===\n"
-                     f"LoRA config: rank={lora_config['lora_rank']}, alpha={lora_config['lora_alpha']}, "
-                     f"dropout={lora_config['lora_dropout']}, targets={lora_config['lora_target_modules']}")
-        
-        # Apply LoRA AFTER loading pretrained weights
-        target_model.apply_lora(
-            rank=lora_config['lora_rank'],
-            alpha=lora_config['lora_alpha'],
-            dropout=lora_config['lora_dropout'],
-            target_modules=lora_config['lora_target_modules'],
-        )
-        
-        # Freeze non-LoRA parameters on the base model
-        freeze_non_lora_parameters(target_model)
-        printer.info("=== END LORA APPLICATION ===")
-    elif enable_lora:
-        printer.warning("LoRA training enabled but no LoRA config found in model!")
-    else:
-        printer.info("LoRA training disabled")
-    
-    # Apply IMU-specific parameter freezing if this is an IMU model
-    freeze_parameters_for_imu_training(model)
-    
-    # Handle LoRA parameter training based on training mode
-    enable_lora = getattr(args.training_mode, 'enable_lora', False)
-    if enable_lora and hasattr(model, 'cut3r_model'):
-        printer.info("=== ENABLING LoRA PARAMETER TRAINING ===")
-        lora_trainable_count = 0
-        for name, param in model.cut3r_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name:
-                param.requires_grad = True
-                lora_trainable_count += 1
-        printer.info(f"Enabled training for {lora_trainable_count} LoRA parameters")
-        
-        # Recalculate trainable parameters
-        total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        printer.info(f"Updated - Trainable parameters: {total_trainable:,} / {total_params:,} ({total_trainable/total_params*100:.3f}%)")
-        printer.info("=== END LoRA PARAMETER ENABLEMENT ===")
-    elif hasattr(model, 'cut3r_model'):
-        # Ensure LoRA parameters are frozen when LoRA training is disabled
-        lora_frozen_count = 0
-        for name, param in model.cut3r_model.named_parameters():
-            if 'lora_A' in name or 'lora_B' in name:
-                param.requires_grad = False
-                lora_frozen_count += 1
-        if lora_frozen_count > 0:
-            printer.info(f"Ensured {lora_frozen_count} LoRA parameters remain frozen (LoRA training disabled)")
+    # Pretrained weights already loaded before state precomputation
+    # if args.pretrained and not args.resume:
+    #     ...already done above...
 
     # # following timm: set wd as 0 for bias and norm layers
-    param_groups = misc.get_parameter_groups(model, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    # 分離 IMU encoder 和 CUT3R 的參數組，設置不同的學習率
+    param_groups = get_imu_parameter_groups(model, args.weight_decay, args)
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
     # print(optimizer)
     loss_scaler = NativeScaler(accelerator=accelerator)
 
@@ -481,7 +559,7 @@ def train(args):
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
-    
+
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
             if log_writer is not None:
@@ -503,67 +581,30 @@ def train(args):
                 f.write(json.dumps(log_stats) + "\n")
 
     def save_model(epoch, fname, best_so_far):
-        misc.save_model(
-            accelerator=accelerator,
-            args=args,
-            model_without_ddp=model,
-            optimizer=optimizer,
-            loss_scaler=loss_scaler,
-            epoch=epoch,
-            fname=fname,
-            best_so_far=best_so_far,
-        )
-        
-        # Save LoRA and IMU weights separately based on training mode
         actual_model = accelerator.unwrap_model(model)
         base_model = actual_model.cut3r_model if hasattr(actual_model, 'cut3r_model') else actual_model
-        enable_lora = getattr(args.training_mode, 'enable_lora', False)
         enable_imu = getattr(args.training_mode, 'enable_imu', False)
-        
-        # Save LoRA weights if LoRA training is enabled
-        if enable_lora and hasattr(base_model, 'config') and hasattr(base_model.config, 'enable_lora') and base_model.config.enable_lora:
-            lora_path = os.path.join(args.output_dir, f"lora_weights_{fname}.pth")
-            lora_state_dict = get_lora_state_dict(base_model)
-            if lora_state_dict and accelerator.is_main_process:
-                torch.save(lora_state_dict, lora_path)
-                total_params = sum(w.numel() for w in lora_state_dict.values())
-                printer.info(f"Saved LoRA weights to {lora_path} ({total_params:,} parameters)")
-            elif accelerator.is_main_process:
-                printer.warning(f"⚠️  No LoRA weights to save for checkpoint {fname}!")
-        
         # Save IMU weights if IMU training is enabled
-        if enable_imu and hasattr(actual_model, 'imu_encoder') and accelerator.is_main_process:
+        if enable_imu and hasattr(actual_model, 'relative_pose_decoder') and accelerator.is_main_process:
             imu_path = os.path.join(args.output_dir, f"imu_weights_{fname}.pth")
-            imu_state_dict = {
-                'imu_encoder': actual_model.imu_encoder.state_dict(),
-            }
+            imu_state_dict = {}
+
+            # Save IMU encoder
+            if hasattr(actual_model, 'imu_encoder'):
+                imu_state_dict['imu_encoder'] = actual_model.imu_encoder.state_dict()
             
-            # Save new IMU-aware pose retriever if it exists
-            if hasattr(actual_model, 'imu_pose_retriever'):
-                imu_state_dict['imu_pose_retriever'] = actual_model.imu_pose_retriever.state_dict()
-            
-            # Save relative pose decoder if it exists
+            # Save relative pose decoder (main IMU component)
             if hasattr(actual_model, 'relative_pose_decoder'):
                 imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
             
-            # Save pose encoder if it exists
-            if hasattr(actual_model, 'pose_encoder'):
-                imu_state_dict['pose_encoder'] = actual_model.pose_encoder.state_dict()
+            # Save new IMU-aware pose retriever if it exists
+            if hasattr(actual_model, 'pose_transformer'):
+                imu_state_dict['pose_transformer'] = actual_model.pose_transformer.state_dict()
             
-            # Save pose token transformer if it exists
-            if hasattr(actual_model, 'pose_token_transformer'):
-                imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
-            
-            # Save pose token fusion MLP if it exists
-            if hasattr(actual_model, 'pose_token_fusion_mlp'):
-                imu_state_dict['pose_token_fusion_mlp'] = actual_model.pose_token_fusion_mlp.state_dict()
-            
-            # Keep old fusion weights for backward compatibility (but they're not used in new architecture)
-            if hasattr(actual_model, 'imu_weight'):
-                imu_state_dict['imu_weight'] = actual_model.imu_weight.data
-            if hasattr(actual_model, 'pose_weight'):
-                imu_state_dict['pose_weight'] = actual_model.pose_weight.data
-            
+            # Save relative pose token if it exists (it's a Parameter, not a module)
+            if hasattr(actual_model, 'relative_pose_token'):
+                imu_state_dict['relative_pose_token'] = actual_model.relative_pose_token
+
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
             imu_params = 0
@@ -575,85 +616,10 @@ def train(args):
                     imu_params += module_dict.numel()
             printer.info(f"Saved IMU weights to {imu_path} ({imu_params:,} parameters)")
 
-    # Load checkpoints (handles both regular and LoRA training)
-    if args.resume:
-        # For LoRA training, we need to load LoRA weights from checkpoint
-        actual_model = accelerator.unwrap_model(model)
-        if hasattr(actual_model, '_lora_config') and actual_model._lora_config is not None:
-            printer.info("=== LOADING LORA CHECKPOINT ===")
-            checkpoint = torch.load(args.resume, map_location=device)
-            
-            # Load LoRA weights if they exist in checkpoint
-            if 'lora_weights' in checkpoint:
-                from lora_utils import load_lora_state_dict
-                load_lora_state_dict(actual_model, checkpoint['lora_weights'])
-                printer.info("Successfully loaded LoRA weights from checkpoint")
-            else:
-                printer.warning("No LoRA weights found in checkpoint!")
-            
-            # Load optimizer state (skip if parameter groups don't match)
-            if 'optimizer' in checkpoint:
-                try:
-                    optimizer.load_state_dict(checkpoint['optimizer'])
-                    printer.info("Loaded optimizer state")
-                except Exception as e:
-                    printer.warning(f"Failed to load optimizer state: {e}")
-                    printer.warning("Continuing with fresh optimizer state...")
-            
-            # Load other training state
-            if 'epoch' in checkpoint:
-                args.start_epoch = checkpoint['epoch'] + 1
-                printer.info(f"Resuming from epoch {args.start_epoch}")
-            
-            # Load best_so_far
-            best_so_far = checkpoint.get('best_so_far', float('inf'))
-            printer.info(f"Best loss so far: {best_so_far}")
-            
-            printer.info("=== END LORA CHECKPOINT LOADING ===")
-        else:
-            # Standard checkpoint loading with optimizer state handling
-            printer.info("=== LOADING STANDARD CHECKPOINT ===")
-            checkpoint = torch.load(args.resume, map_location=device)
-            
-            # Load model weights
-            model.load_state_dict(checkpoint["model"], strict=False)
-            printer.info("Loaded model weights")
-            
-            # Load optimizer state (skip if parameter groups don't match)
-            if 'optimizer' in checkpoint:
-                try:
-                    optimizer.load_state_dict(checkpoint['optimizer'])
-                    printer.info("Loaded optimizer state")
-                except Exception as e:
-                    printer.warning(f"Failed to load optimizer state: {e}")
-                    printer.warning("Continuing with fresh optimizer state...")
-            
-            # Load other training state
-            if 'epoch' in checkpoint:
-                args.start_epoch = checkpoint['epoch'] + 1
-                printer.info(f"Resuming from epoch {args.start_epoch}")
-            else:
-                args.start_epoch = 0
-            
-            # Load scaler state
-            if 'scaler' in checkpoint and loss_scaler is not None:
-                try:
-                    loss_scaler.load_state_dict(checkpoint['scaler'])
-                    printer.info("Loaded loss scaler state")
-                except Exception as e:
-                    printer.warning(f"Failed to load loss scaler state: {e}")
-            
-            # Load best_so_far
-            best_so_far = checkpoint.get('best_so_far', float('inf'))
-            printer.info(f"Best loss so far: {best_so_far}")
-            
-            printer.info("=== END STANDARD CHECKPOINT LOADING ===")
-    else:
-        # No checkpoint to resume from
-        args.start_epoch = 0
-        best_so_far = float('inf')
-        printer.info("Starting training from scratch")
-    
+
+    best_so_far = misc.load_model(
+        args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
+    )
     if best_so_far is None:
         best_so_far = float("inf")
     log_writer = (
@@ -719,6 +685,8 @@ def train(args):
             loss_scaler,
             log_writer=log_writer,
             args=args,
+            slack_notifier=slack_notifier,
+            slack_config=slack_config,
         )
 
     total_time = time.time() - start_time
@@ -726,6 +694,20 @@ def train(args):
     printer.info("Training time {}".format(total_time_str))
 
     save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
+    
+    # Send Slack notification for training completion
+    if (accelerator.is_main_process and slack_notifier and 
+        slack_config.get('send_on_completion', True)):
+        try:
+            slack_notifier.send_training_complete(
+                args=args,
+                total_time=total_time_str,
+                best_loss=best_so_far if best_so_far != float("inf") else None,
+                output_dir=args.output_dir
+            )
+            printer.info("Slack notification sent successfully")
+        except Exception as e:
+            printer.error(f"Failed to send Slack notification: {e}")
 
 
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
@@ -749,68 +731,45 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
     printer.info(f"LoRA training: {is_lora_training}, LoRA params: {lora_param_count}, LoRA weights: {len(lora_state_dict) if lora_state_dict else 0}")
     printer.info(f"IMU training: {is_imu_training}")
     
-    checkpoint_path = output_dir / "checkpoint-final.pth"
+    # checkpoint_path = output_dir / "checkpoint-final.pth"
     
     if is_lora_training or lora_param_count > 0 or is_imu_training:
-        # Save enhanced checkpoint (LoRA and/or IMU)
-        to_save = {
-            "args": args,
-            "epoch": epoch,
-            "model_config": getattr(base_model, 'config', None),
-        }
-        if best_so_far is not None:
-            to_save["best_so_far"] = best_so_far
+        # # Save enhanced checkpoint (LoRA and/or IMU)
+        # to_save = {
+        #     "args": args,
+        #     "epoch": epoch,
+        #     "model_config": getattr(base_model, 'config', None),
+        # }
+        # if best_so_far is not None:
+        #     to_save["best_so_far"] = best_so_far
         
-        # Add LoRA weights if available
-        if lora_state_dict:
-            to_save["lora_weights"] = lora_state_dict
+        # # Add IMU config if available
+        # if is_imu_training:
+        #     to_save["imu_config"] = getattr(args, 'imu_config', {})
         
-        # Add IMU config if available
-        if is_imu_training:
-            to_save["imu_config"] = getattr(args, 'imu_config', {})
-        
-        printer.info(f">> Saving enhanced checkpoint to {checkpoint_path} ...")
-        misc.save_on_master(accelerator, to_save, checkpoint_path)
-        
-        # Save standalone LoRA weights if LoRA training is enabled
-        if enable_lora and lora_state_dict and accelerator.is_main_process:
-            lora_path = output_dir / "lora_weights_final.pth"
-            torch.save(lora_state_dict, lora_path)
-            total_params = sum(w.numel() for w in lora_state_dict.values())
-            printer.info(f"✅ Saved LoRA weights: {len(lora_state_dict)} tensors, {total_params:,} params")
+        # printer.info(f">> Saving enhanced checkpoint to {checkpoint_path} ...")
+        # misc.save_on_master(accelerator, to_save, checkpoint_path)
         
         # Save standalone IMU weights if IMU training is enabled
         if enable_imu and is_imu_training and accelerator.is_main_process:
             imu_path = output_dir / "imu_weights_final.pth"
-            imu_state_dict = {
-                'imu_encoder': actual_model.imu_encoder.state_dict(),
-            }
+            imu_state_dict = {}
             
-            # Save new IMU-aware pose retriever if it exists
-            if hasattr(actual_model, 'imu_pose_retriever'):
-                imu_state_dict['imu_pose_retriever'] = actual_model.imu_pose_retriever.state_dict()
-            
-            # Save relative pose decoder if it exists
+            # Save relative pose decoder (main IMU component)
             if hasattr(actual_model, 'relative_pose_decoder'):
                 imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
             
-            # Save pose encoder if it exists
-            if hasattr(actual_model, 'pose_encoder'):
-                imu_state_dict['pose_encoder'] = actual_model.pose_encoder.state_dict()
-            
-            # Save pose token transformer if it exists
-            if hasattr(actual_model, 'pose_token_transformer'):
-                imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
-            
-            # Save pose token fusion MLP if it exists
-            if hasattr(actual_model, 'pose_token_fusion_mlp'):
-                imu_state_dict['pose_token_fusion_mlp'] = actual_model.pose_token_fusion_mlp.state_dict()
-            
-            # Keep old fusion weights for backward compatibility (but they're not used in new architecture)
-            if hasattr(actual_model, 'imu_weight'):
-                imu_state_dict['imu_weight'] = actual_model.imu_weight.data
-            if hasattr(actual_model, 'pose_weight'):
-                imu_state_dict['pose_weight'] = actual_model.pose_weight.data
+            # Save IMU encoder
+            if hasattr(actual_model, 'imu_encoder'):
+                imu_state_dict['imu_encoder'] = actual_model.imu_encoder.state_dict()
+
+            # Save new IMU-aware pose retriever if it exists
+            if hasattr(actual_model, 'pose_transformer'):
+                imu_state_dict['pose_transformer'] = actual_model.pose_transformer.state_dict()
+
+            # Save relative pose token if it exists (it's a Parameter, not a module)
+            if hasattr(actual_model, 'relative_pose_token'):
+                imu_state_dict['relative_pose_token'] = actual_model.relative_pose_token
             
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
@@ -822,20 +781,20 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
                     # For scalar parameters like imu_weight, pose_weight
                     imu_params += module_dict.numel()
             printer.info(f"✅ Saved IMU weights: {imu_params:,} params")
-    else:
-        # Save standard model
-        to_save = {
-            "args": args,
-            "model": actual_model.cpu().state_dict() if not isinstance(actual_model, dict) else actual_model,
-            "epoch": epoch,
-        }
-        if best_so_far is not None:
-            to_save["best_so_far"] = best_so_far
-        printer.info(f">> Saving model to {checkpoint_path} ...")
-        misc.save_on_master(accelerator, to_save, checkpoint_path)
+    # else:
+    #     # Save standard model
+    #     to_save = {
+    #         "args": args,
+    #         "model": actual_model.cpu().state_dict() if not isinstance(actual_model, dict) else actual_model,
+    #         "epoch": epoch,
+    #     }
+    #     if best_so_far is not None:
+    #         to_save["best_so_far"] = best_so_far
+    #     printer.info(f">> Saving model to {checkpoint_path} ...")
+    #     misc.save_on_master(accelerator, to_save, checkpoint_path)
 
 
-def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
+def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False, extra_context=None):
     split = ["Train", "Test"][test]
     printer.info(f"Building {split} Data loader for dataset: {dataset}")
     loader = get_data_loader(
@@ -846,7 +805,8 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
         shuffle=False,
         drop_last=not (test),
         accelerator=accelerator,
-        fixed_length=fixed_length
+        fixed_length=fixed_length,
+        extra_context=extra_context
     )
     return loader
 
@@ -861,72 +821,52 @@ def train_one_epoch(
     loss_scaler,
     args,
     log_writer=None,
+    slack_notifier=None,
+    slack_config=None,
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
     model.train(True)
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    if hasattr(unwrapped_model, 'cut3r_model'):
+        unwrapped_model.cut3r_model.eval()  # 强制保持 eval 模式
+    
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter("imu_lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter("cut3r_lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
     accum_iter = args.accum_iter
 
-    def save_model(epoch, fname, best_so_far):
-        misc.save_model(
-            accelerator=accelerator,
-            args=args,
-            model_without_ddp=model,
-            optimizer=optimizer,
-            loss_scaler=loss_scaler,
-            epoch=epoch,
-            fname=fname,
-            best_so_far=best_so_far,
-        )
-        
+    def save_model(epoch, fname, best_so_far):        
         # Save LoRA and IMU weights separately based on training mode
         actual_model = accelerator.unwrap_model(model)
         base_model = actual_model.cut3r_model if hasattr(actual_model, 'cut3r_model') else actual_model
         enable_lora = getattr(args.training_mode, 'enable_lora', False)
         enable_imu = getattr(args.training_mode, 'enable_imu', False)
         
-        # Save LoRA weights if LoRA training is enabled
-        if enable_lora and hasattr(base_model, 'config') and hasattr(base_model.config, 'enable_lora') and base_model.config.enable_lora:
-            lora_path = os.path.join(args.output_dir, f"lora_weights_{fname}.pth")
-            lora_state_dict = get_lora_state_dict(base_model)
-            if lora_state_dict and accelerator.is_main_process:
-                torch.save(lora_state_dict, lora_path)
-                total_params = sum(w.numel() for w in lora_state_dict.values())
-                printer.info(f"Saved LoRA weights to {lora_path} ({total_params:,} parameters)")
-            elif accelerator.is_main_process:
-                printer.warning(f"⚠️  No LoRA weights to save for checkpoint {fname}!")
         
         # Save IMU weights if IMU training is enabled
-        if enable_imu and hasattr(actual_model, 'imu_encoder') and accelerator.is_main_process:
+        if enable_imu and hasattr(actual_model, 'relative_pose_decoder') and accelerator.is_main_process:
             imu_path = os.path.join(args.output_dir, f"imu_weights_{fname}.pth")
-            imu_state_dict = {
-                'imu_encoder': actual_model.imu_encoder.state_dict(),
-            }
+            imu_state_dict = {}
             
-            # Save new IMU-aware pose retriever if it exists
-            if hasattr(actual_model, 'imu_pose_retriever'):
-                imu_state_dict['imu_pose_retriever'] = actual_model.imu_pose_retriever.state_dict()
-            
-            # Save relative pose decoder if it exists
+            # Save relative pose decoder (main IMU component)
             if hasattr(actual_model, 'relative_pose_decoder'):
                 imu_state_dict['relative_pose_decoder'] = actual_model.relative_pose_decoder.state_dict()
             
-            # Save pose token transformer if it exists
-            if hasattr(actual_model, 'pose_token_transformer'):
-                imu_state_dict['pose_token_transformer'] = actual_model.pose_token_transformer.state_dict()
-            
-            # Save pose token fusion MLP if it exists
-            if hasattr(actual_model, 'pose_token_fusion_mlp'):
-                imu_state_dict['pose_token_fusion_mlp'] = actual_model.pose_token_fusion_mlp.state_dict()
-            
-            # Keep old fusion weights for backward compatibility (but they're not used in new architecture)
-            if hasattr(actual_model, 'imu_weight'):
-                imu_state_dict['imu_weight'] = actual_model.imu_weight.data
-            if hasattr(actual_model, 'pose_weight'):
-                imu_state_dict['pose_weight'] = actual_model.pose_weight.data
+            # Save IMU encoder
+            if hasattr(actual_model, 'imu_encoder'):
+                imu_state_dict['imu_encoder'] = actual_model.imu_encoder.state_dict()
+
+            # Save new IMU-aware pose retriever if it exists
+            if hasattr(actual_model, 'pose_transformer'):
+                imu_state_dict['pose_transformer'] = actual_model.pose_transformer.state_dict()
+
+            # Save relative pose token if it exists (it's a Parameter, not a module)
+            if hasattr(actual_model, 'relative_pose_token'):
+                imu_state_dict['relative_pose_token'] = actual_model.relative_pose_token
             
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
@@ -961,7 +901,12 @@ def train_one_epoch(
             step = int(epoch_f * len(data_loader))
             # we use a per iteration (instead of per epoch) lr scheduler
             if data_iter_step % accum_iter == 0:
-                misc.adjust_learning_rate(optimizer, epoch_f, args)
+                # 使用分離的學習率調度器
+                imu_lr, cut3r_lr = adjust_imu_learning_rate(optimizer, epoch_f, args)
+            else:
+                # 如果沒有更新學習率，使用當前優化器中的學習率
+                imu_lr = optimizer.param_groups[0]["lr"]  # 默認值
+                cut3r_lr = optimizer.param_groups[0]["lr"]  # 默認值
             if not args.long_context:
                 result = loss_of_one_batch(
                     batch,
@@ -988,9 +933,17 @@ def train_one_epoch(
             loss_value = float(loss)
 
             if not math.isfinite(loss_value):
-                print(
-                    f"Loss is {loss_value}, stopping training, loss details: {loss_details}"
-                )
+                error_msg = f"Loss is {loss_value}, stopping training, loss details: {loss_details}"
+                print(error_msg)
+                
+                # Send Slack notification for training error
+                if (slack_notifier and slack_notifier.enabled and accelerator.is_main_process and
+                    slack_config.get('send_on_error', True)):
+                    try:
+                        slack_notifier.send_training_error(error_msg, args)
+                    except Exception as e:
+                        print(f"Failed to send Slack error notification: {e}")
+                
                 sys.exit(1)
             if not result.get("already_backprop", False):
                 loss_scaler(
@@ -1014,9 +967,12 @@ def train_one_epoch(
             else:
                 torch.cuda.empty_cache()
 
-            lr = optimizer.param_groups[0]["lr"]
+            # 獲取分離的學習率
+            lr = optimizer.param_groups[0]["lr"]  # 保持向後兼容
             metric_logger.update(epoch=epoch_f)
             metric_logger.update(lr=lr)
+            metric_logger.update(imu_lr=imu_lr)
+            metric_logger.update(cut3r_lr=cut3r_lr)
             metric_logger.update(step=step)
 
             metric_logger.update(loss=loss_value, **loss_details)

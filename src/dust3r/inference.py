@@ -274,21 +274,22 @@ def inference_recurrent(groups, model, device, verbose=True):
     ignore_keys = set(
         ["depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"]
     )
-    for view in groups:
-        for name in view.keys():  # pseudo_focal
-            if name in ignore_keys:
-                continue
-            if isinstance(view[name], tuple) or isinstance(view[name], list):
-                view[name] = [x.to(device, non_blocking=True) for x in view[name]]
-            else:
-                view[name] = view[name].to(device, non_blocking=True)
-
     if verbose:
-        print(f">> Inference with model on {len(groups)} image/raymaps")
-
+        print(f">> Inference with model on {len(groups)} image/raymaps (one at a time)")
+    # Keep views on CPU initially
+    cpu_views = []
+    for view in groups:
+        cpu_view = {}
+        for name, value in view.items():
+            if name in ignore_keys:
+                cpu_view[name] = value
+            else:
+                # Keep on CPU for now
+                cpu_view[name] = value
+        cpu_views.append(cpu_view)
     with torch.cuda.amp.autocast(enabled=False):
         preds, batch, state_args = model.forward_recurrent(
-            groups, device, ret_state=True
+            cpu_views, device, ret_state=True
         )
         res = dict(views=batch, pred=preds)
     result = to_cpu(res)

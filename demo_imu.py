@@ -12,7 +12,7 @@ Usage:
 
 Example:
     python demo_imu.py --model_path src/cut3r_512_dpt_4_64.pth \
-        --imu_path src/checkpoints/cut3r_relative_decoder/imu_weights_best.pth \
+        --imu_path src/checkpoints/cut3r_relative_decoder/imu_weights_last.pth \
         --seq_path /project2/larg3r/dataset/dust3r_data/processed_kitti/kitti_00/rgb \
         --imu_data_path /project2/larg3r/dataset/dust3r_data/processed_kitti/kitti_00/imu \
         --device cuda --size 512
@@ -101,7 +101,17 @@ def parse_args():
         default=1,
         help="Update state every N frames (default: 8). Set to 1 to update every frame.",
     )
-
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Enable streaming inference mode - process images one by one with continuous state management.",
+    )
+    parser.add_argument(
+        "--gt_pose_path",
+        type=str,
+        default="",
+        help="Path to the directory containing ground truth camera poses (.npz files). If not provided, will use seq_path/../cam",
+    )
     return parser.parse_args()
 
 
@@ -147,6 +157,74 @@ def load_imu_data(imu_dir, img_basenames):
             imu_data_list.append(np.zeros((10, 6), dtype=np.float32))
     
     return imu_data_list
+
+
+def load_gt_poses(gt_pose_dir, img_basenames):
+    """
+    Load ground truth camera poses for corresponding image files.
+    
+    Args:
+        gt_pose_dir (str): Directory containing GT pose files (.npz format)
+        img_basenames (list): List of image basenames (without extension)
+        
+    Returns:
+        tuple: (gt_poses, gt_intrinsics) - lists of 4x4 pose matrices and 3x3 intrinsics matrices
+               Returns (None, None) if loading fails
+    """
+    gt_poses = []
+    gt_intrinsics = []
+    
+    for basename in img_basenames:
+        pose_file_path = os.path.join(gt_pose_dir, basename + ".npz")
+        
+        if os.path.exists(pose_file_path):
+            try:
+                pose_file = np.load(pose_file_path)
+                pose = pose_file["pose"]  # Shape: (4, 4)
+                intrinsics = pose_file["intrinsics"]  # Shape: (3, 3)
+                
+                gt_poses.append(pose.astype(np.float32))
+                gt_intrinsics.append(intrinsics.astype(np.float32))
+                
+            except Exception as e:
+                print(f"Warning: Failed to load GT pose for {basename}: {e}")
+                return None, None
+        else:
+            print(f"Warning: GT pose file not found: {pose_file_path}")
+            return None, None
+    
+    print(f"Successfully loaded {len(gt_poses)} ground truth poses")
+    return gt_poses, gt_intrinsics
+
+
+def align_poses_to_first_frame(pred_poses, gt_poses):
+    """
+    Align GT poses to predicted poses using the first frame.
+    
+    Args:
+        pred_poses (np.ndarray): Predicted poses, shape (N, 4, 4)
+        gt_poses (list or np.ndarray): GT poses, each is a 4x4 matrix
+        
+    Returns:
+        np.ndarray: Aligned GT poses, shape (N, 4, 4)
+    """
+    # Convert to numpy arrays if needed
+    if isinstance(gt_poses, list):
+        gt_poses = np.array(gt_poses)
+    
+    # Get the transformation from GT first frame to predicted first frame
+    # T_align = T_pred_0 @ inv(T_gt_0)
+    gt_first_inv = np.linalg.inv(gt_poses[0])
+    pred_first = pred_poses[0]
+    T_align = pred_first @ gt_first_inv
+    
+    # Apply alignment to all GT poses
+    aligned_gt_poses = []
+    for gt_pose in gt_poses:
+        aligned_pose = T_align @ gt_pose
+        aligned_gt_poses.append(aligned_pose)
+    
+    return np.array(aligned_gt_poses)
 
 
 def prepare_input(
@@ -250,10 +328,21 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
 
     # Recover camera poses.
-    pr_poses = [
-        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-        for pred in outputs["pred"]
-    ]
+    # camera_pose format: (B, 12) = (B, 3 + 9) - translation + 9D rotation matrix
+    from src.dust3r.utils.camera import rotation_9d_to_matrix
+    
+    pr_poses = []
+    for pred in outputs["pred"]:
+        camera_pose = pred["camera_pose"].clone().cpu()  # (B, 12)
+        trans = camera_pose[:, :3]  # (B, 3)
+        rot_9d = camera_pose[:, 3:12]  # (B, 9)
+        rot_mat = rotation_9d_to_matrix(rot_9d)  # (B, 3, 3)
+        
+        # Construct 4x4 pose matrix
+        pose_4x4 = torch.eye(4).unsqueeze(0).repeat(camera_pose.shape[0], 1, 1)
+        pose_4x4[:, :3, :3] = rot_mat
+        pose_4x4[:, :3, 3] = trans
+        pr_poses.append(pose_4x4)
     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
     t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
 
@@ -430,42 +519,92 @@ def load_lora_weights(model, lora_path, device):
 
 def load_imu_weights(model, imu_path, device):
     """
-    Load IMU weights and convert model to CUT3RIMU if needed
+    Load IMU weights and convert model to CUT3RIMU if needed.
+    Supports both old format (direct state dict) and new format (checkpoint with 'imu_weights' key).
     """
     if not os.path.exists(imu_path):
         print(f"Warning: IMU path {imu_path} does not exist")
         return model
     
     print(f"Loading IMU weights from {imu_path}")
-    imu_state_dict = torch.load(imu_path, map_location=device)
+    checkpoint = torch.load(imu_path, map_location=device)
+    
+    # Handle different checkpoint formats
+    if isinstance(checkpoint, dict):
+        if 'imu_weights' in checkpoint:
+            # New format: checkpoint with 'imu_weights' key
+            print("✅ Detected new checkpoint format (with 'imu_weights' key)")
+            imu_state_dict = checkpoint['imu_weights']
+            epoch = checkpoint.get('epoch', 'unknown')
+            best_loss = checkpoint.get('best_so_far', 'unknown')
+            print(f"   Checkpoint from epoch {epoch}, best loss: {best_loss}")
+        elif 'model' in checkpoint:
+            # Old full model checkpoint format
+            print("⚠️  Detected old checkpoint format (full model)")
+            print("   Attempting to extract IMU weights from full model...")
+            full_model_state = checkpoint['model']
+            # Extract IMU-related keys from full model
+            imu_state_dict = {}
+            for key in ['imu_encoder', 'relative_pose_decoder', 'pose_transformer', 'relative_pose_token']:
+                # Try both with and without 'module.' prefix (for DDP)
+                for prefix in ['', 'module.']:
+                    full_key = f"{prefix}{key}"
+                    if full_key in full_model_state:
+                        imu_state_dict[key] = full_model_state[full_key]
+                        break
+                    # Also try to extract nested weights
+                    matching_keys = {k: v for k, v in full_model_state.items() if k.startswith(f"{prefix}{key}.")}
+                    if matching_keys:
+                        # Build nested state dict
+                        nested_dict = {}
+                        for k, v in matching_keys.items():
+                            nested_key = k.replace(f"{prefix}{key}.", "")
+                            nested_dict[nested_key] = v
+                        imu_state_dict[key] = nested_dict
+                        break
+        else:
+            # Assume it's a direct state dict (very old format)
+            print("⚠️  Detected direct state dict format")
+            imu_state_dict = checkpoint
+    else:
+        print("⚠️  Unknown checkpoint format")
+        imu_state_dict = checkpoint
+    
+    # Check if we found any IMU weights
+    if not imu_state_dict:
+        print("❌ No IMU weights found in checkpoint!")
+        return model
+    
+    print(f"Found IMU components: {list(imu_state_dict.keys())}")
     
     # Check if model is already CUT3RIMU
     if hasattr(model, 'imu_encoder') and hasattr(model, 'cut3r_model'):
         print("Model is already CUT3RIMU, loading weights...")
+        
         # Load IMU encoder weights
         if 'imu_encoder' in imu_state_dict:
-            model.imu_encoder.load_state_dict(imu_state_dict['imu_encoder'])
-            print("✅ Loaded IMU encoder weights")
+            if isinstance(imu_state_dict['imu_encoder'], dict):
+                model.imu_encoder.load_state_dict(imu_state_dict['imu_encoder'])
+                print("✅ Loaded IMU encoder weights")
+            else:
+                print("⚠️  IMU encoder weights format unexpected")
         
-        # Load IMU pose retriever weights
-        if 'imu_pose_retriever' in imu_state_dict and hasattr(model, 'imu_pose_retriever'):
-            model.imu_pose_retriever.load_state_dict(imu_state_dict['imu_pose_retriever'])
-            print("✅ Loaded IMU pose retriever weights")
+        # Load relative_pose_token
+        if 'relative_pose_token' in imu_state_dict and hasattr(model, 'relative_pose_token'):
+            model.relative_pose_token.data.copy_(imu_state_dict['relative_pose_token'])
+            print("✅ Loaded relative_pose_token")
+        
+        # Load pose transformer weights
+        if 'pose_transformer' in imu_state_dict and hasattr(model, 'pose_transformer'):
+            if isinstance(imu_state_dict['pose_transformer'], dict):
+                model.pose_transformer.load_state_dict(imu_state_dict['pose_transformer'])
+                print("✅ Loaded pose transformer weights")
         
         # Load relative pose decoder weights
         if 'relative_pose_decoder' in imu_state_dict and hasattr(model, 'relative_pose_decoder'):
-            model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
-            print("✅ Loaded relative pose decoder weights")
-        
-        # Load pose token transformer weights
-        if 'pose_token_transformer' in imu_state_dict and hasattr(model, 'pose_token_transformer'):
-            model.pose_token_transformer.load_state_dict(imu_state_dict['pose_token_transformer'])
-            print("✅ Loaded pose token transformer weights")
-        
-        # Load pose token fusion MLP weights
-        if 'pose_token_fusion_mlp' in imu_state_dict and hasattr(model, 'pose_token_fusion_mlp'):
-            model.pose_token_fusion_mlp.load_state_dict(imu_state_dict['pose_token_fusion_mlp'])
-            print("✅ Loaded pose token fusion MLP weights")
+            if isinstance(imu_state_dict['relative_pose_decoder'], dict):
+                model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
+                print("✅ Loaded relative pose decoder weights")
         
         return model
     else:
@@ -473,40 +612,38 @@ def load_imu_weights(model, imu_path, device):
         print("Converting model to CUT3RIMU...")
         from dust3r.imu_encoder import CUT3RIMU
         
-        # Create IMU config from the loaded weights
+        # Create IMU config
         imu_config = {
-            'input_dim': 6,  # Default IMU input dimension
-            'seq_len': 10,   # Default sequence length
-            'dropout': 0.1   # Default dropout
+            'input_dim': 6,
+            'seq_len': 10,
+            'dropout': 0.1
         }
         
-        # Create CUT3RIMU model (device is handled in initialization)
+        # Create CUT3RIMU model
         imu_model = CUT3RIMU(model, imu_config)
         
         # Load IMU encoder weights
         if 'imu_encoder' in imu_state_dict:
-            imu_model.imu_encoder.load_state_dict(imu_state_dict['imu_encoder'])
-            print("✅ Loaded IMU encoder weights")
+            if isinstance(imu_state_dict['imu_encoder'], dict):
+                imu_model.imu_encoder.load_state_dict(imu_state_dict['imu_encoder'])
+                print("✅ Loaded IMU encoder weights")
         
-        # Load IMU pose retriever weights
-        if 'imu_pose_retriever' in imu_state_dict and hasattr(imu_model, 'imu_pose_retriever'):
-            imu_model.imu_pose_retriever.load_state_dict(imu_state_dict['imu_pose_retriever'])
-            print("✅ Loaded IMU pose retriever weights")
+        # Load relative_pose_token
+        if 'relative_pose_token' in imu_state_dict and hasattr(imu_model, 'relative_pose_token'):
+            imu_model.relative_pose_token.data.copy_(imu_state_dict['relative_pose_token'])
+            print("✅ Loaded relative_pose_token")
+        
+        # Load pose transformer weights
+        if 'pose_transformer' in imu_state_dict and hasattr(imu_model, 'pose_transformer'):
+            if isinstance(imu_state_dict['pose_transformer'], dict):
+                imu_model.pose_transformer.load_state_dict(imu_state_dict['pose_transformer'])
+                print("✅ Loaded pose transformer weights")
         
         # Load relative pose decoder weights
         if 'relative_pose_decoder' in imu_state_dict and hasattr(imu_model, 'relative_pose_decoder'):
-            imu_model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
-            print("✅ Loaded relative pose decoder weights")
-        
-        # Load pose token transformer weights
-        if 'pose_token_transformer' in imu_state_dict and hasattr(imu_model, 'pose_token_transformer'):
-            imu_model.pose_token_transformer.load_state_dict(imu_state_dict['pose_token_transformer'])
-            print("✅ Loaded pose token transformer weights")
-        
-        # Load pose token fusion MLP weights
-        if 'pose_token_fusion_mlp' in imu_state_dict and hasattr(imu_model, 'pose_token_fusion_mlp'):
-            imu_model.pose_token_fusion_mlp.load_state_dict(imu_state_dict['pose_token_fusion_mlp'])
-            print("✅ Loaded pose token fusion MLP weights")
+            if isinstance(imu_state_dict['relative_pose_decoder'], dict):
+                imu_model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
+                print("✅ Loaded relative pose decoder weights")
         
         print("✅ Successfully converted to CUT3RIMU and loaded all IMU weights")
         return imu_model
@@ -549,6 +686,9 @@ def run_inference(args):
     
     img_mask = [True] * len(img_paths)
 
+    # Extract basenames from image paths (used for IMU and GT pose loading)
+    img_basenames = [os.path.splitext(os.path.basename(path))[0] for path in img_paths]
+    
     # Prepare IMU data if IMU path is provided
     imu_data_list = None
     if args.imu_path:  # Only load IMU data if IMU weights are provided
@@ -561,13 +701,31 @@ def run_inference(args):
         
         if os.path.exists(imu_dir):
             print(f"Loading IMU data from {imu_dir}...")
-            # Extract basenames from image paths
-            img_basenames = [os.path.splitext(os.path.basename(path))[0] for path in img_paths]
             imu_data_list = load_imu_data(imu_dir, img_basenames)
             print(f"Loaded IMU data for {len(imu_data_list)} images")
         else:
             print(f"Warning: IMU data directory {imu_dir} not found. Running without IMU data.")
             imu_data_list = [np.zeros((10, 6), dtype=np.float32) for _ in img_paths]
+    
+    # Load GT poses if provided
+    gt_poses = None
+    gt_intrinsics = None
+    if args.gt_pose_path:
+        # Use specified GT pose path
+        gt_pose_dir = args.gt_pose_path
+    else:
+        # Use default path: seq_path/../cam
+        gt_pose_dir = os.path.join(os.path.dirname(args.seq_path), "..", "cam")
+    
+    if args.gt_pose_path or os.path.exists(gt_pose_dir):
+        print(f"Loading ground truth poses from {gt_pose_dir}...")
+        gt_poses, gt_intrinsics = load_gt_poses(gt_pose_dir, img_basenames)
+        if gt_poses is not None:
+            print(f"Loaded {len(gt_poses)} ground truth poses")
+        else:
+            print("Failed to load ground truth poses")
+    else:
+        print("No ground truth pose path provided and default path not found.")
 
     # Prepare input views.
     print("Preparing input views...")
@@ -591,25 +749,44 @@ def run_inference(args):
     print(f"Frames that will update state: {update_frames}")
     print(f"Total frames: {len(views)}, Frames with state update: {len(update_frames)}")
     
-    # Move views to device
-    for view in views:
-        view["img"] = view["img"].to(device)
-        view["ray_map"] = view["ray_map"].to(device)
-        view["true_shape"] = view["true_shape"].to(device)
-        view["camera_pose"] = view["camera_pose"].to(device)
-        view["img_mask"] = view["img_mask"].to(device)
-        view["ray_mask"] = view["ray_mask"].to(device)
-        view["update"] = view["update"].to(device)
-        view["reset"] = view["reset"].to(device)
-        if "imu" in view:
-            view["imu"] = view["imu"].to(device)
+    # For streaming mode, keep views on CPU; for batch mode, move to GPU
+    if not args.streaming:
+        # Move views to device for batch processing
+        for view in views:
+            view["img"] = view["img"].to(device)
+            view["ray_map"] = view["ray_map"].to(device)
+            view["true_shape"] = view["true_shape"].to(device)
+            view["camera_pose"] = view["camera_pose"].to(device)
+            view["img_mask"] = view["img_mask"].to(device)
+            view["ray_mask"] = view["ray_mask"].to(device)
+            view["update"] = view["update"].to(device)
+            view["reset"] = view["reset"].to(device)
+            if "imu" in view:
+                view["imu"] = view["imu"].to(device)
+    else:
+        print("Streaming mode: keeping views on CPU for memory efficiency")
     
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
 
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
-    model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
+    
+    # Check if this is a training checkpoint or pretrained model
+    checkpoint = torch.load(args.model_path, map_location=device)
+    
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        # This is a training checkpoint
+        print("Loading from training checkpoint...")
+        model = ARCroco3DStereo.from_pretrained("src/cut3r_512_dpt_4_64.pth").to(device)
+        # Load the model weights from checkpoint
+        from dust3r.model import strip_module
+        model.load_state_dict(strip_module(checkpoint['model']), strict=False)
+        print("✅ Loaded model weights from training checkpoint")
+    else:
+        # This is a pretrained model
+        print("Loading from pretrained model...")
+        model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
     
     # Load LoRA weights if provided
     if args.lora_path and os.path.exists(args.lora_path):
@@ -646,14 +823,24 @@ def run_inference(args):
     model.eval()
 
     # Run inference.
-    print("Running inference...")
-    start_time = time.time()
-    outputs, state_args = inference(views, model, device)
-    total_time = time.time() - start_time
-    per_frame_time = total_time / len(views)
-    print(
-        f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
-    )
+    if args.streaming:
+        print("Running streaming inference...")
+        start_time = time.time()
+        outputs, state_args = inference_recurrent(views, model, device)
+        total_time = time.time() - start_time
+        per_frame_time = total_time / len(views)
+        print(
+            f"Streaming inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
+        )
+    else:
+        print("Running batch inference...")
+        start_time = time.time()
+        outputs, state_args = inference(views, model, device)
+        total_time = time.time() - start_time
+        per_frame_time = total_time / len(views)
+        print(
+            f"Batch inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
+        )
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
@@ -665,6 +852,42 @@ def run_inference(args):
     pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
     colors_to_vis = [c.cpu().numpy() for c in colors]
     edge_colors = [None] * len(pts3ds_to_vis)
+
+    # Prepare GT camera parameters if available
+    gt_cam_dict = None
+    if gt_poses is not None and gt_intrinsics is not None:
+        print("Aligning ground truth poses to predicted poses...")
+        
+        # Get predicted poses from cam_dict
+        pred_R = cam_dict["R"]  # (N, 3, 3)
+        pred_t = cam_dict["t"]  # (N, 3)
+        
+        # Construct predicted 4x4 poses
+        pred_poses = np.zeros((len(pred_R), 4, 4), dtype=np.float32)
+        for i in range(len(pred_R)):
+            pred_poses[i, :3, :3] = pred_R[i]
+            pred_poses[i, :3, 3] = pred_t[i]
+            pred_poses[i, 3, 3] = 1.0
+        
+        # Align GT poses to predicted poses using first frame
+        aligned_gt_poses = align_poses_to_first_frame(pred_poses, gt_poses)
+        
+        # Extract R and t from aligned GT poses
+        gt_R = aligned_gt_poses[:, :3, :3]
+        gt_t = aligned_gt_poses[:, :3, 3]
+        
+        # Get focal length and principal point from GT intrinsics
+        gt_focal = np.array([intrinsics[0, 0] for intrinsics in gt_intrinsics])
+        gt_pp = np.array([[intrinsics[0, 2], intrinsics[1, 2]] for intrinsics in gt_intrinsics])
+        
+        gt_cam_dict = {
+            "focal": gt_focal,
+            "pp": gt_pp,
+            "R": gt_R,
+            "t": gt_t,
+        }
+        
+        print(f"✅ Aligned {len(aligned_gt_poses)} GT poses to predicted trajectory")
 
     # Create and run the point cloud viewer.
     print("Launching point cloud viewer...")
@@ -679,7 +902,8 @@ def run_inference(args):
         edge_color_list=edge_colors,
         show_camera=True,
         vis_threshold=args.vis_threshold,
-        size = args.size
+        size=args.size,
+        gt_cam_dict=gt_cam_dict  # Pass GT camera parameters
     )
     viewer.run()
 

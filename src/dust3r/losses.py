@@ -1,6 +1,7 @@
 from copy import copy, deepcopy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dust3r.inference import get_pred_pts3d, find_opt_scaling
 from dust3r.utils.geometry import (
@@ -21,9 +22,6 @@ from dust3r.utils.camera import (
     pose_encoding_to_camera,
     camera_to_pose_encoding,
     relative_pose_absT_quatR,
-    quaternion_multiply,
-    rotate_vector,
-    standardize_quaternion,
 )
 
 
@@ -338,44 +336,69 @@ class Regr3DPose(Criterion, MultiLoss):
     def get_norm_factor_poses(self, gt_trans, pr_trans, not_metric_mask):
         batch_size = gt_trans[0].shape[0]
 
+        # CRITICAL FIX: For metric scale data (KITTI), don't normalize!
+        # Only normalize non-metric data to preserve metric scale relationships
         if self.norm_mode and not self.gt_scale:
-            gt_trans = [x[:, None, None, :].clone() for x in gt_trans]
-            valids = [torch.ones_like(x[..., 0], dtype=torch.bool) for x in gt_trans]
-            norm_factor_gt = (
-                normalize_pointcloud_group(
-                    gt_trans,
-                    self.norm_mode,
-                    valids,
-                    ret_factor_only=True,
+            # Check if we have any non-metric data that needs normalization
+            if not_metric_mask.sum() > 0:
+                # We have non-metric data: normalize only the non-metric portion
+                gt_trans_not_metric = [
+                    x[not_metric_mask][:, None, None, :].clone() for x in gt_trans
+                ]
+                if len(gt_trans_not_metric) > 0 and gt_trans_not_metric[0].numel() > 0:
+                    valids = [torch.ones_like(x[..., 0], dtype=torch.bool) for x in gt_trans_not_metric]
+                    norm_factor_gt_not_metric = (
+                        normalize_pointcloud_group(
+                            gt_trans_not_metric,
+                            self.norm_mode,
+                            valids,
+                            ret_factor_only=True,
+                        )
+                        .squeeze(-1)
+                        .squeeze(-1)
+                    )
+                    # Initialize all to 1.0 (no normalization for metric data)
+                    norm_factor_gt = torch.ones(
+                        batch_size, 1, dtype=gt_trans[0].dtype, device=gt_trans[0].device
+                    )
+                    # Only apply normalization to non-metric data
+                    norm_factor_gt[not_metric_mask] = norm_factor_gt_not_metric
+                else:
+                    norm_factor_gt = torch.ones(
+                        batch_size, 1, dtype=gt_trans[0].dtype, device=gt_trans[0].device
+                    )
+            else:
+                # All data is metric scale: don't normalize (keep factor = 1.0)
+                norm_factor_gt = torch.ones(
+                    batch_size, 1, dtype=gt_trans[0].dtype, device=gt_trans[0].device
                 )
-                .squeeze(-1)
-                .squeeze(-1)
-            )
         else:
             norm_factor_gt = torch.ones(
                 batch_size, 1, dtype=gt_trans[0].dtype, device=gt_trans[0].device
             )
 
+        # For predictions: same logic
         norm_factor_pr = norm_factor_gt.clone()
         if self.norm_mode and not_metric_mask.sum() > 0 and not self.gt_scale:
             pr_trans_not_metric = [
                 x[not_metric_mask][:, None, None, :].clone() for x in pr_trans
             ]
-            valids = [
-                torch.ones_like(x[..., 0], dtype=torch.bool)
-                for x in pr_trans_not_metric
-            ]
-            norm_factor_pr_not_metric = (
-                normalize_pointcloud_group(
-                    pr_trans_not_metric,
-                    self.norm_mode,
-                    valids,
-                    ret_factor_only=True,
+            if len(pr_trans_not_metric) > 0 and pr_trans_not_metric[0].numel() > 0:
+                valids = [
+                    torch.ones_like(x[..., 0], dtype=torch.bool)
+                    for x in pr_trans_not_metric
+                ]
+                norm_factor_pr_not_metric = (
+                    normalize_pointcloud_group(
+                        pr_trans_not_metric,
+                        self.norm_mode,
+                        valids,
+                        ret_factor_only=True,
+                    )
+                    .squeeze(-1)
+                    .squeeze(-1)
                 )
-                .squeeze(-1)
-                .squeeze(-1)
-            )
-            norm_factor_pr[not_metric_mask] = norm_factor_pr_not_metric
+                norm_factor_pr[not_metric_mask] = norm_factor_pr_not_metric
         return norm_factor_gt, norm_factor_pr
 
     def get_all_pts3d(
@@ -439,7 +462,7 @@ class Regr3DPose(Criterion, MultiLoss):
             )
 
         norm_factor_pr = norm_factor_gt.clone()
-        if self.norm_mode and not_metric_mask.sum() > 0 and not self.gt_scale:
+        if self.norm_all and self.norm_mode and not_metric_mask.sum() > 0 and not self.gt_scale:
             norm_factor_pr_not_metric = self.get_norm_factor_point_cloud(
                 [pr_pt_self[not_metric_mask] for pr_pt_self in pr_pts_self],
                 [pr_pt_cross[not_metric_mask] for pr_pt_cross in pr_pts_cross],
@@ -458,37 +481,39 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_pts_self = [pts / norm_factor_pr for pts in pr_pts_self]
         pr_pts_cross = [pts / norm_factor_pr for pts in pr_pts_cross]
 
-        # [(Bx3, BX4), (BX3, BX4), ...], 3 for translation, 4 for quaternion
-        gt_poses = [
-            camera_to_pose_encoding(in_camera1 @ gt["camera_pose"]).clone()
-            for gt in gts
-        ]
-        # 使用累積的 global pose，如果沒有則使用原始的 camera_pose
-        # pr_poses = []
-        # for pred in preds:
-        #     if "camera_pose" in pred:
-        #         pr_poses.append(pred["camera_pose"].clone())
-        #     else:
-        #         # 如果沒有 camera_pose，創建一個 identity pose
-        #         batch_size = pred["pts3d_in_self_view"].shape[0]
-        #         device = pred["pts3d_in_self_view"].device
-        #         dtype = pred["pts3d_in_self_view"].dtype
-        #         identity_pose = torch.zeros(batch_size, 7, device=device, dtype=dtype)
-        #         identity_pose[:, 3] = 1.0  # quaternion w component
-        #         pr_poses.append(identity_pose)
-        pr_poses = [pred["camera_pose"].clone() for pred in preds]
+        # Convert GT poses to 9D rotation matrix format
+        # GT camera_pose is 4x4 matrix, convert to (trans, rot_9d) format
+        from dust3r.utils.camera import rotation_matrix_to_9d
+        
+        gt_poses = []
+        for gt in gts:
+            # in_camera1 @ gt["camera_pose"] gives the pose in camera1 frame
+            pose_mat = in_camera1 @ gt["camera_pose"]  # (B, 4, 4)
+            trans = pose_mat[:, :3, 3]  # (B, 3)
+            rot_mat = pose_mat[:, :3, :3]  # (B, 3, 3)
+            rot_9d = rotation_matrix_to_9d(rot_mat)  # (B, 9)
+            gt_poses.append((trans.clone(), rot_9d.clone()))
+        
+        # Predicted poses are already in (trans, rot_9d) format from imu_encoder
+        pr_poses = []
+        for pred in preds:
+            # pred["camera_pose"] is (B, 12) = (B, 3 + 9)
+            trans = pred["camera_pose"][:, :3]  # (B, 3)
+            rot_9d = pred["camera_pose"][:, 3:12]  # (B, 9)
+            pr_poses.append((trans.clone(), rot_9d.clone()))
+            
         pose_norm_factor_gt = norm_factor_gt.clone().squeeze(2, 3)
         pose_norm_factor_pr = norm_factor_pr.clone().squeeze(2, 3)
 
         if norm_pose_separately:
-            gt_trans = [gt[:, :3] for gt in gt_poses]
-            pr_trans = [pr[:, :3] for pr in pr_poses]
+            gt_trans = [gt[0] for gt in gt_poses]
+            pr_trans = [pr[0] for pr in pr_poses]
             pose_norm_factor_gt, pose_norm_factor_pr = self.get_norm_factor_poses(
                 gt_trans, pr_trans, not_metric_mask
             )
         elif any(camera_only):
-            gt_trans = [gt[:, :3] for gt in gt_poses]
-            pr_trans = [pr[:, :3] for pr in pr_poses]
+            gt_trans = [gt[0] for gt in gt_poses]
+            pr_trans = [pr[0] for pr in pr_poses]
             pose_only_norm_factor_gt, pose_only_norm_factor_pr = (
                 self.get_norm_factor_poses(gt_trans, pr_trans, not_metric_mask)
             )
@@ -499,11 +524,12 @@ class Regr3DPose(Criterion, MultiLoss):
                 camera_only[:, None], pose_only_norm_factor_pr, pose_norm_factor_pr
             )
 
+        # Normalize poses (now using tuple format (trans, rot_9d))
         gt_poses = [
-            (gt[:, :3] / pose_norm_factor_gt.clip(eps), gt[:, 3:]) for gt in gt_poses
+            (gt[0] / pose_norm_factor_gt.clip(eps), gt[1]) for gt in gt_poses
         ]
         pr_poses = [
-            (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
+            (pr[0] / pose_norm_factor_pr.clip(eps), pr[1]) for pr in pr_poses
         ]
         pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
             pose_norm_factor_pr.squeeze() > eps
@@ -588,7 +614,7 @@ class Regr3DPose(Criterion, MultiLoss):
 
         # normalize 3d points
         # compute the scale using only the self view point maps
-        if self.norm_mode and not self.gt_scale:
+        if self.norm_all and self.norm_mode and not self.gt_scale:
             norm_factor_gt = self.get_norm_factor_point_cloud(
                 gt_pts_self[:1],
                 gt_pts_cross[:1],
@@ -602,7 +628,7 @@ class Regr3DPose(Criterion, MultiLoss):
                 preds[0]["pts3d_in_other_view"][:, :1, :1, :1]
             )
 
-        if self.norm_mode:
+        if self.norm_all and self.norm_mode:
             norm_factor_pr = self.get_norm_factor_point_cloud(
                 pr_pts_self[:1],
                 pr_pts_cross[:1],
@@ -629,37 +655,36 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_pts_self = [pts / norm_factor_pr for pts in pr_pts_self]
         pr_pts_cross = [pts / norm_factor_pr for pts in pr_pts_cross]
 
-        # [(Bx3, BX4), (BX3, BX4), ...], 3 for translation, 4 for quaternion
-        gt_poses = [
-            camera_to_pose_encoding(in_camera1 @ gt["camera_pose"]).clone()
-            for gt in gts
-        ]
-        # 使用累積的 global pose，如果沒有則使用原始的 camera_pose
-        # pr_poses = []
-        # for pred in preds:
-        #     if "camera_pose" in pred:
-        #         pr_poses.append(pred["camera_pose"].clone())
-        #     else:
-        #         # 如果沒有 camera_pose，創建一個 identity pose
-        #         batch_size = pred["pts3d_in_self_view"].shape[0]
-        #         device = pred["pts3d_in_self_view"].device
-        #         dtype = pred["pts3d_in_self_view"].dtype
-        #         identity_pose = torch.zeros(batch_size, 7, device=device, dtype=dtype)
-        #         identity_pose[:, 3] = 1.0  # quaternion w component
-        #         pr_poses.append(identity_pose)
-        pr_poses = [pred["camera_pose"].clone() for pred in preds]
+        # Convert GT poses to 9D rotation matrix format
+        from dust3r.utils.camera import rotation_matrix_to_9d
+        
+        gt_poses = []
+        for gt in gts:
+            pose_mat = in_camera1 @ gt["camera_pose"]  # (B, 4, 4)
+            trans = pose_mat[:, :3, 3]  # (B, 3)
+            rot_mat = pose_mat[:, :3, :3]  # (B, 3, 3)
+            rot_9d = rotation_matrix_to_9d(rot_mat)  # (B, 9)
+            gt_poses.append((trans.clone(), rot_9d.clone()))
+        
+        # Predicted poses are already in (trans, rot_9d) format
+        pr_poses = []
+        for pred in preds:
+            trans = pred["camera_pose"][:, :3]  # (B, 3)
+            rot_9d = pred["camera_pose"][:, 3:12]  # (B, 9)
+            pr_poses.append((trans.clone(), rot_9d.clone()))
+            
         pose_norm_factor_gt = norm_factor_gt.clone().squeeze(2, 3)
         pose_norm_factor_pr = norm_factor_pr.clone().squeeze(2, 3)
 
         if norm_pose_separately:
-            gt_trans = [gt[:, :3] for gt in gt_poses][:1]
-            pr_trans = [pr[:, :3] for pr in pr_poses][:1]
+            gt_trans = [gt[0] for gt in gt_poses][:1]
+            pr_trans = [pr[0] for pr in pr_poses][:1]
             pose_norm_factor_gt, pose_norm_factor_pr = self.get_norm_factor_poses(
                 gt_trans, pr_trans, torch.ones_like(not_metric_mask)
             )
         elif any(camera_only):
-            gt_trans = [gt[:, :3] for gt in gt_poses][:1]
-            pr_trans = [pr[:, :3] for pr in pr_poses][:1]
+            gt_trans = [gt[0] for gt in gt_poses][:1]
+            pr_trans = [pr[0] for pr in pr_poses][:1]
             pose_only_norm_factor_gt, pose_only_norm_factor_pr = (
                 self.get_norm_factor_poses(
                     gt_trans, pr_trans, torch.ones_like(not_metric_mask)
@@ -679,11 +704,12 @@ class Regr3DPose(Criterion, MultiLoss):
             ).mean()
         else:
             pose_scale_loss = 0.0
+        # Normalize poses (now using tuple format (trans, rot_9d))
         gt_poses = [
-            (gt[:, :3] / pose_norm_factor_gt.clip(eps), gt[:, 3:]) for gt in gt_poses
+            (gt[0] / pose_norm_factor_gt.clip(eps), gt[1]) for gt in gt_poses
         ]
         pr_poses = [
-            (pr[:, :3] / pose_norm_factor_pr.clip(eps), pr[:, 3:]) for pr in pr_poses
+            (pr[0] / pose_norm_factor_pr.clip(eps), pr[1]) for pr in pr_poses
         ]
 
         pose_masks = (pose_norm_factor_gt.squeeze() > eps) & (
@@ -725,66 +751,97 @@ class Regr3DPose(Criterion, MultiLoss):
         )
 
     def compute_relative_pose_loss(
-        self, gt_trans, gt_quats, pr_trans, pr_quats, masks=None
+        self, gt_trans, gt_rots_9d, pr_trans, pr_rots_9d, masks=None
     ):
+        """
+        Compute relative pose loss using 9D rotation matrix representation.
+        
+        Args:
+            gt_trans: (B, N, 3) GT translations
+            gt_rots_9d: (B, N, 9) GT rotations as 9D vectors (flattened 3x3 matrices)
+            pr_trans: (B, N, 3) Predicted translations
+            pr_rots_9d: (B, N, 9) Predicted rotations as 9D vectors
+            masks: Optional mask for valid poses
+        """
+        from dust3r.utils.camera import rotation_9d_to_matrix, rotation_matrix_to_9d
+        
         if masks is None:
             masks = torch.ones(len(gt_trans), dtype=torch.bool, device=gt_trans.device)
-        gt_trans_matrix1 = gt_trans[:, :, None, :].repeat(1, 1, gt_trans.shape[1], 1)[
-            masks
-        ]
-        gt_trans_matrix2 = gt_trans[:, None, :, :].repeat(1, gt_trans.shape[1], 1, 1)[
-            masks
-        ]
-        gt_quats_matrix1 = gt_quats[:, :, None, :].repeat(1, 1, gt_quats.shape[1], 1)[
-            masks
-        ]
-        gt_quats_matrix2 = gt_quats[:, None, :, :].repeat(1, gt_quats.shape[1], 1, 1)[
-            masks
-        ]
-        pr_trans_matrix1 = pr_trans[:, :, None, :].repeat(1, 1, pr_trans.shape[1], 1)[
-            masks
-        ]
-        pr_trans_matrix2 = pr_trans[:, None, :, :].repeat(1, pr_trans.shape[1], 1, 1)[
-            masks
-        ]
-        pr_quats_matrix1 = pr_quats[:, :, None, :].repeat(1, 1, pr_quats.shape[1], 1)[
-            masks
-        ]
-        pr_quats_matrix2 = pr_quats[:, None, :, :].repeat(1, pr_quats.shape[1], 1, 1)[
-            masks
-        ]
-
-        gt_rel_trans, gt_rel_quats = relative_pose_absT_quatR(
-            gt_trans_matrix1, gt_quats_matrix1, gt_trans_matrix2, gt_quats_matrix2
-        )
-        pr_rel_trans, pr_rel_quats = relative_pose_absT_quatR(
-            pr_trans_matrix1, pr_quats_matrix1, pr_trans_matrix2, pr_quats_matrix2
-        )
-        rel_trans_err = torch.norm(gt_rel_trans - pr_rel_trans, dim=-1)
-        rel_quats_err = torch.norm(gt_rel_quats - pr_rel_quats, dim=-1)
-        return rel_trans_err.mean() + rel_quats_err.mean() * 40.0
+        
+        # Create pairwise matrices: (B, N, N, D)
+        gt_trans_matrix1 = gt_trans[:, :, None, :].repeat(1, 1, gt_trans.shape[1], 1)  # (B, N, N, 3)
+        gt_trans_matrix2 = gt_trans[:, None, :, :].repeat(1, gt_trans.shape[1], 1, 1)  # (B, N, N, 3)
+        
+        gt_rots_matrix1 = gt_rots_9d[:, :, None, :].repeat(1, 1, gt_rots_9d.shape[1], 1)  # (B, N, N, 9)
+        gt_rots_matrix2 = gt_rots_9d[:, None, :, :].repeat(1, gt_rots_9d.shape[1], 1, 1)  # (B, N, N, 9)
+        
+        pr_trans_matrix1 = pr_trans[:, :, None, :].repeat(1, 1, pr_trans.shape[1], 1)  # (B, N, N, 3)
+        pr_trans_matrix2 = pr_trans[:, None, :, :].repeat(1, pr_trans.shape[1], 1, 1)  # (B, N, N, 3)
+        
+        pr_rots_matrix1 = pr_rots_9d[:, :, None, :].repeat(1, 1, pr_rots_9d.shape[1], 1)  # (B, N, N, 9)
+        pr_rots_matrix2 = pr_rots_9d[:, None, :, :].repeat(1, pr_rots_9d.shape[1], 1, 1)  # (B, N, N, 9)
+        
+        # Apply mask and flatten: (B, N, N, D) -> (num_valid * N * N, D)
+        B, N = gt_trans.shape[:2]
+        gt_trans_matrix1 = gt_trans_matrix1[masks].reshape(-1, 3)  # (num_valid*N*N, 3)
+        gt_trans_matrix2 = gt_trans_matrix2[masks].reshape(-1, 3)
+        gt_rots_matrix1 = gt_rots_matrix1[masks].reshape(-1, 9)  # (num_valid*N*N, 9)
+        gt_rots_matrix2 = gt_rots_matrix2[masks].reshape(-1, 9)
+        pr_trans_matrix1 = pr_trans_matrix1[masks].reshape(-1, 3)
+        pr_trans_matrix2 = pr_trans_matrix2[masks].reshape(-1, 3)
+        pr_rots_matrix1 = pr_rots_matrix1[masks].reshape(-1, 9)
+        pr_rots_matrix2 = pr_rots_matrix2[masks].reshape(-1, 9)
+        
+        # Convert 9D to rotation matrices: (num_pairs, 9) -> (num_pairs, 3, 3)
+        gt_R1 = rotation_9d_to_matrix(gt_rots_matrix1)
+        gt_R2 = rotation_9d_to_matrix(gt_rots_matrix2)
+        pr_R1 = rotation_9d_to_matrix(pr_rots_matrix1)
+        pr_R2 = rotation_9d_to_matrix(pr_rots_matrix2)
+        
+        # Compute relative rotation: R_rel = R2^T @ R1
+        gt_R_rel = torch.bmm(gt_R2.transpose(-2, -1), gt_R1)  # (num_pairs, 3, 3)
+        pr_R_rel = torch.bmm(pr_R2.transpose(-2, -1), pr_R1)  # (num_pairs, 3, 3)
+        
+        # Compute relative translation: t_rel = R2^T @ (t1 - t2)
+        delta_trans_gt = gt_trans_matrix1 - gt_trans_matrix2
+        gt_t_rel = torch.bmm(gt_R2.transpose(-2, -1), delta_trans_gt.unsqueeze(-1)).squeeze(-1)
+        
+        delta_trans_pr = pr_trans_matrix1 - pr_trans_matrix2
+        pr_t_rel = torch.bmm(pr_R2.transpose(-2, -1), delta_trans_pr.unsqueeze(-1)).squeeze(-1)
+        
+        # Compute losses
+        rel_trans_err = torch.norm(gt_t_rel - pr_t_rel, dim=-1)
+        
+        # For rotation, use Frobenius norm of the difference
+        rel_rot_err = torch.norm(gt_R_rel - pr_R_rel, dim=(-2, -1))  # Frobenius norm
+        
+        return rel_trans_err.mean() + rel_rot_err.mean() 
 
     def compute_pose_loss(self, gt_poses, pred_poses, masks=None):
         """
-        gt_pose: list of (Bx3, Bx4)
-        pred_pose: list of (Bx3, Bx4)
+        Compute pose loss using 9D rotation matrix representation.
+        
+        Args:
+            gt_pose: list of (Bx3, Bx9) - (translation, 9D rotation matrix)
+            pred_pose: list of (Bx3, Bx9) - (translation, 9D rotation matrix)
         masks: None, or B
         """
         gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
-        gt_quats = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BXNX3
-        pred_trans = torch.stack([pr[0] for pr in pred_poses], dim=1)  # BxNx4
-        pred_quats = torch.stack([pr[1] for pr in pred_poses], dim=1)  # BxNx4
+        gt_rots_9d = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BxNx9
+        pred_trans = torch.stack([pr[0] for pr in pred_poses], dim=1)  # BxNx3
+        pred_rots_9d = torch.stack([pr[1] for pr in pred_poses], dim=1)  # BxNx9
+        
         if masks == None:
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1).mean()
-                + torch.norm(pred_quats - gt_quats, dim=-1).mean() * 40.0
+                + torch.norm(pred_rots_9d - gt_rots_9d, dim=-1).mean() 
             )
         else:
             if not any(masks):
                 return torch.tensor(0.0)
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
-                + torch.norm(pred_quats - gt_quats, dim=-1)[masks].mean() * 40.0
+                + torch.norm(pred_rots_9d - gt_rots_9d, dim=-1)[masks].mean() 
             )
 
         return pose_loss
@@ -964,87 +1021,55 @@ class Regr3DPoseBatchList(Regr3DPose):
             details["pose_loss"] = pose_loss
             
             gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
-            gt_quats = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BXNX3
-            pr_trans = torch.stack([pr[0] for pr in pr_poses], dim=1)  # BxNx4
-            pr_quats = torch.stack([pr[1] for pr in pr_poses], dim=1)  # BxNx4
+            gt_rots_9d = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BxNx9
+            pr_trans = torch.stack([pr[0] for pr in pr_poses], dim=1)  # BxNx3
+            pr_rots_9d = torch.stack([pr[1] for pr in pr_poses], dim=1)  # BxNx9
 
             rel_pose_loss = self.compute_relative_pose_loss(
-                gt_trans, gt_quats, pr_trans, pr_quats, masks=None
+                gt_trans, gt_rots_9d, pr_trans, pr_rots_9d, masks=None
             )
             details["relative_pose_loss"] = rel_pose_loss
 
-            # 先把所有 GT pose 轉成 4x4 矩陣，避免 loop 裡重複做
-            num_views = len(preds)
-            P_gt = []
-            for i in range(num_views):
-                gt_pose_7d = torch.cat([gt_poses[i][0], gt_poses[i][1]], dim=-1)  # (B,7)
-                P_gt.append(pose_encoding_to_camera(gt_pose_7d))  # list of (B,4,4)
-            P_gt = torch.stack(P_gt, dim=0)  # (N, B, 4, 4)
-
-            # 預先算 frame 1 的 GT inverse（用作 cross 的 reference 起點）
-            P1_gt = P_gt[0]  # (B,4,4)
-            inv_P1_gt = torch.linalg.inv(P1_gt)  # (B,4,4)
-
-            relative_transform_loss = []
-            for i in range(num_views):
-                for j in range(num_views):
-                    if i == j:
-                        continue
-
-                    # --- cross-view prediction: 把 pred_pts_cross[i] 從 frame1 -> frame j，用 GT pose ---
-                    Pj_gt = P_gt[j]  # (B,4,4)
-                    T_cross_gt = Pj_gt @ inv_P1_gt  # frame1 -> j
-                    pts_pred_cross_in_j = geotrf(T_cross_gt, pred_pts_cross[i])  # (B, H, W, 3)
-
-                    # --- self-view prediction: 把 pred_pts_self[i] 從 frame i -> frame j，用 GT pose ---
-                    Pi_gt = P_gt[i]
-                    inv_Pi_gt = torch.linalg.inv(Pi_gt)
-                    T_self_gt = Pj_gt @ inv_Pi_gt  # i -> j
-                    pts_self_in_j = geotrf(T_self_gt, pred_pts_self[i])  # (B, H, W, 3)
-                    loss_ij = self.single_view_criterion(pts_pred_cross_in_j, pts_self_in_j.detach(), masks[i]).mean()
-                    relative_transform_loss.append(loss_ij)
-
-            avg_relative_transform_loss = torch.stack(relative_transform_loss).mean()
-            details["relative_transform_loss"] = float(avg_relative_transform_loss.item())
-
-
-            transform_losses = []
-            for i in range(len(preds)):
-                gt_pose_7d = torch.cat([gt_poses[i][0], gt_poses[i][1]], dim=-1) # (B, 7)
-                gt_pose_4x4 = pose_encoding_to_camera(gt_pose_7d)  # (B, 4, 4)
-                pred_pts_self_i = pred_pts_self[i]  # (B, H, W, 3)
-                pred_pts_world = geotrf(gt_pose_4x4, pred_pts_self_i)  # (B, H, W, 3)
-                pred_pts_cross_i = pred_pts_cross[i]  # (B, H, W, 3)
-                transform_loss = self.single_view_criterion(pred_pts_world, pred_pts_cross_i, masks[i]).mean()
-                transform_losses.append(transform_loss)
-            avg_transform_loss = torch.stack(transform_losses).mean()
-            details["transform_loss"] = float(avg_transform_loss.item())
-            
             relative_pose_token_losses = []
             for i in range(1, len(preds)):
                 # 檢查是否有 relative_pose
                 if "relative_pose" not in preds[i]:
                     continue
                     
-                pred_rel_pose = preds[i]["relative_pose"]  # (B, 7)
+                pred_rel_pose = preds[i]["relative_pose"]  # (B, 12) = (B, 3 + 9)
                 
-                # 修正：從累積的 global poses 計算出正確的相對姿態
-                # pr_poses[i] 是一個元組 (trans, quat)
-                pred_trans_prev = pr_poses[i-1][0]  # (B, 3)
-                pred_quat_prev = pr_poses[i-1][1]   # (B, 4)
-                pred_trans_curr = pr_poses[i][0]    # (B, 3)
-                pred_quat_curr = pr_poses[i][1]     # (B, 4)
+                # 使用 GT pose 計算 relative pose 作為監督目標
+                # gt_poses[i] 是一個元組 (trans, rot_9d)
+                from dust3r.utils.camera import rotation_9d_to_matrix, rotation_matrix_to_9d
                 
-                # 計算從前一幀到當前幀的相對姿態（這應該與預測的 relative_pose 一致）
-                pred_rel_trans, pred_rel_quat = relative_pose_absT_quatR(
-                    pred_trans_prev, pred_quat_prev, pred_trans_curr, pred_quat_curr
+                gt_trans_prev = gt_poses[i-1][0]  # (B, 3)
+                gt_rot_9d_prev = gt_poses[i-1][1]  # (B, 9)
+                gt_trans_curr = gt_poses[i][0]    # (B, 3)
+                gt_rot_9d_curr = gt_poses[i][1]   # (B, 9)
+                
+                # 將 9D rotation 轉換成 3x3 rotation matrix
+                gt_R_prev = rotation_9d_to_matrix(gt_rot_9d_prev)  # (B, 3, 3)
+                gt_R_curr = rotation_9d_to_matrix(gt_rot_9d_curr)  # (B, 3, 3)
+                
+                # 計算 GT 的相對姿態 (R_rel = R_curr^T @ R_prev)
+                gt_R_rel = torch.bmm(gt_R_curr.transpose(-2, -1), gt_R_prev)  # (B, 3, 3)
+                
+                # 相對平移：t_rel = R_curr^T @ (t_prev - t_curr)
+                delta_trans = gt_trans_prev - gt_trans_curr
+                gt_rel_trans = torch.bmm(gt_R_curr.transpose(-2, -1), delta_trans.unsqueeze(-1)).squeeze(-1)  # (B, 3)
+                
+                # 將 GT relative rotation matrix 展平為 9D
+                gt_rel_rot_9d = rotation_matrix_to_9d(gt_R_rel)  # (B, 9)
+                
+                # 提取預測的 relative pose
+                pred_rel_trans = pred_rel_pose[:, :3]  # (B, 3)
+                pred_rel_rot_9d = pred_rel_pose[:, 3:12]  # (B, 9)
+                
+                # 計算相對姿態loss（直接在 9D rotation matrix 空間計算）
+                rel_pose_token_loss = (
+                    torch.norm(pred_rel_trans - gt_rel_trans, dim=-1).mean() +
+                    torch.norm(pred_rel_rot_9d - gt_rel_rot_9d, dim=-1).mean() 
                 )
-                
-                # 計算相對姿態損失
-                # 比較預測的 relative pose 和從累積 global poses 計算出的相對姿態
-                rel_trans_loss = torch.norm(pred_rel_pose[:, :3] - pred_rel_trans, dim=-1).mean()
-                rel_quat_loss = torch.norm(pred_rel_pose[:, 3:] - pred_rel_quat, dim=-1).mean() * 40.0
-                rel_pose_token_loss = rel_trans_loss + rel_quat_loss
                 
                 relative_pose_token_losses.append(rel_pose_token_loss)
             
@@ -1055,38 +1080,7 @@ class Regr3DPoseBatchList(Regr3DPose):
                 avg_relative_pose_token_loss = torch.tensor(0.0, device=gt_poses[0][0].device)
                 details["relative_pose_token_loss"] = 0.0
 
-            # 融合 token ≈ 幾何組合(prev_global, ΔT_pred) 一致性損失
-            compose_consistency_losses = []
-            for i in range(1, len(preds)):
-                if "relative_pose" not in preds[i]:
-                    continue
-                # 取前一幀全局姿態與當前預測相對姿態
-                # 對前一幀全局姿態做 stop-grad，避免兩側共同遷就造成退化
-                t_prev = pr_poses[i - 1][0].detach()          # (B,3)
-                q_prev = pr_poses[i - 1][1].detach()          # (B,4)
-                rel = preds[i]["relative_pose"]               # (B,7)
-                dt, dq = rel[:, :3], rel[:, 3:]                # (B,3), (B,4)
-
-                # 幾何組合：
-                # t_hat = t_prev + R(q_prev) * dt
-                # q_hat = standardize(dq * q_prev)  # 先应用相对旋转，再应用前一帧旋转
-                t_hat = t_prev + rotate_vector(q_prev, dt)
-                q_hat = standardize_quaternion(quaternion_multiply(dq, q_prev))
-
-                # 當前幀全局預測
-                t_curr, q_curr = pr_poses[i]
-
-                trans_l = torch.norm(t_hat - t_curr, dim=-1).mean()
-                quat_l = torch.norm(q_hat - q_curr, dim=-1).mean() * 40.0
-                compose_consistency_losses.append(trans_l + quat_l)
-
-            if compose_consistency_losses:
-                fusion_compose_consistency = torch.stack(compose_consistency_losses).mean()
-                details["fusion_compose_consistency_loss"] = float(fusion_compose_consistency.item())
-            else:
-                fusion_compose_consistency = torch.tensor(0.0, device=gt_poses[0][0].device)
-
-            total_loss = pose_loss + avg_relative_pose_token_loss #+ fusion_compose_consistency
+            total_loss = avg_relative_pose_token_loss + rel_pose_loss
             
             return total_loss, details
 

@@ -337,7 +337,8 @@ class PointCloudViewer:
         port=8080,
         show_camera=True,
         vis_threshold=1,
-        size=512
+        size=512,
+        gt_cam_dict=None
     ):
         self.model = model
         self.size=size
@@ -352,12 +353,14 @@ class PointCloudViewer:
             pc_list, color_list, conf_list, edge_color_list
         )
         self.cam_dict = cam_dict
+        self.gt_cam_dict = gt_cam_dict  # Ground truth camera parameters
         self.num_frames = len(self.all_steps)
         self.image_mask = image_mask
         self.show_camera = show_camera
         self.on_replay = False
         self.vis_pts_list = []
         self.traj_list = []
+        self.gt_traj_list = []  # GT camera trajectory
         self.orig_img_list = [x[0] for x in color_list]
         self.via_points = []
 
@@ -409,6 +412,17 @@ class PointCloudViewer:
             step=0.01,
             initial_value=0.1,
         )
+        
+        # Calculate the actual maximum points per frame from the data
+        self.max_points_per_frame = self._calculate_max_points_per_frame()
+        initial_points_count = min(40, self.max_points_per_frame)  # Start with 5000 points
+        self.pointcloud_size_slider = self.server.add_gui_slider(
+            "Visible Points",
+            min=10,
+            max=self.max_points_per_frame,
+            step=10,
+            initial_value=initial_points_count,
+        )
 
         self.pc_handles = []
         self.cam_handles = []
@@ -424,7 +438,24 @@ class PointCloudViewer:
                 handle.scale = self.camsize_slider.value
                 handle.line_thickness = 0.03 * handle.scale
 
+        @self.pointcloud_size_slider.on_update
+        def _(_) -> None:
+            self.update_pointcloud_size()
+
         self.server.on_client_connect(self._connect_client)
+
+    def _calculate_max_points_per_frame(self):
+        """Calculate the maximum number of points in any frame from the actual data"""        
+        max_points = 0
+        for step in self.all_steps:
+            pc = self.pcs[step]["pc"]
+            # Count total points in this frame
+            current_points = pc.reshape(-1, 3).shape[0]
+            # Update max_points if current frame has more points
+            max_points = max(max_points, current_points)
+        
+        print(f"Calculated max points per frame: {max_points}")
+        return max_points
 
     def get_camera_state(self, client: viser.ClientHandle) -> CameraState:
         camera = client.camera
@@ -645,14 +676,51 @@ class PointCloudViewer:
             color = color[conf > self.vis_threshold]
         return pred_pts, color
 
+    def parse_pc_data_with_limit(
+        self,
+        pc,
+        color,
+        conf=None,
+        edge_color=[0.251, 0.702, 0.902],
+        max_points=5000,
+        set_border_color=False,
+    ):
+        """Parse point cloud data with a limit on the number of points"""
+        pred_pts = pc.reshape(-1, 3)  # [N, 3]
+
+        if set_border_color and edge_color is not None:
+            color = self.set_color_border(color[0], color=edge_color)
+        if np.isnan(color).any():
+            color = np.zeros((pred_pts.shape[0], 3))
+            color[:, 2] = 1
+        else:
+            color = color.reshape(-1, 3)
+        
+        if conf is not None:
+            conf = conf[0].reshape(-1)
+            mask = conf > self.vis_threshold
+            pred_pts = pred_pts[mask]
+            color = color[mask]
+        
+        # Limit the number of points
+        if len(pred_pts) > max_points:
+            # Randomly sample points to maintain distribution
+            indices = np.random.choice(len(pred_pts), max_points, replace=False)
+            pred_pts = pred_pts[indices]
+            color = color[indices]
+        
+        return pred_pts, color
+
     def add_pc(self, step):
         pc = self.pcs[step]["pc"]
         color = self.pcs[step]["color"]
         conf = self.pcs[step]["conf"]
         edge_color = self.pcs[step].get("edge_color", None)
 
-        pred_pts, color = self.parse_pc_data(
-            pc, color, conf, edge_color, set_border_color=True
+        # Use the limited version with current slider value
+        max_points = int(self.pointcloud_size_slider.value)
+        pred_pts, color = self.parse_pc_data_with_limit(
+            pc, color, conf, edge_color, max_points, set_border_color=True
         )
 
         self.vis_pts_list.append(pred_pts)
@@ -664,6 +732,28 @@ class PointCloudViewer:
                 point_size=0.005,
             )
         )
+
+    def update_pointcloud_size(self):
+        """Update the number of points displayed in each point cloud based on the slider value"""
+        max_points = int(self.pointcloud_size_slider.value)
+        
+        # Re-generate all point clouds with the new point limit
+        for i, step in enumerate(self.all_steps):
+            if i < len(self.pc_handles):
+                # Get original data
+                pc = self.pcs[step]["pc"]
+                color = self.pcs[step]["color"]
+                conf = self.pcs[step]["conf"]
+                edge_color = self.pcs[step].get("edge_color", None)
+                
+                # Parse and limit points
+                pred_pts, limited_color = self.parse_pc_data_with_limit(
+                    pc, color, conf, edge_color, max_points, set_border_color=True
+                )
+                
+                # Update the existing handle
+                self.pc_handles[i].points = pred_pts
+                self.pc_handles[i].colors = limited_color
 
     def add_camera(self, step):
         cam = self.cam_dict
@@ -692,6 +782,33 @@ class PointCloudViewer:
                 image=self.orig_img_list[step][::4, ::4]
             )
         )
+        
+        # Add GT camera if available
+        if self.gt_cam_dict is not None:
+            gt_cam = self.gt_cam_dict
+            gt_focal = gt_cam["focal"][step]
+            gt_pp = gt_cam["pp"][step]
+            gt_R = gt_cam["R"][step]
+            gt_t = gt_cam["t"][step]
+            
+            gt_q = tf.SO3.from_matrix(gt_R).wxyz
+            gt_fov = 2 * np.arctan(gt_pp[0] / gt_focal)
+            gt_aspect = gt_pp[0] / gt_pp[1]
+            self.gt_traj_list.append((gt_q, gt_t))
+            
+            # GT camera: black color, no image
+            self.cam_handles.append(
+                self.server.add_camera_frustum(
+                    name=f"/frames/{step}/gt_camera",
+                    fov=gt_fov,
+                    aspect=gt_aspect,
+                    wxyz=gt_q,
+                    position=gt_t,
+                    scale=0.1,
+                    color=(0.0, 0.0, 0.0),  # Black color for GT
+                    image=None  # No image for GT
+                )
+            )
 
     def animate(self):
         with self.server.add_gui_folder("Playback"):
@@ -760,6 +877,8 @@ class PointCloudViewer:
             if self.show_camera:
                 self.add_camera(step)
 
+        # Point clouds are already created with the initial size limit from the slider
+        
         prev_timestep = gui_timestep.value
         while True:
             if self.on_replay:
@@ -769,12 +888,11 @@ class PointCloudViewer:
                     gui_timestep.value = (gui_timestep.value + 1) % self.num_frames
 
                 for i, frame_node in enumerate(self.frame_nodes):
-                    if i % 10 == 0:
-                        frame_node.visible = (
-                            i <= gui_timestep.value
-                            if not self.fourd
-                            else i == gui_timestep.value
-                        )
+                    frame_node.visible = (
+                        i <= gui_timestep.value
+                        if not self.fourd
+                        else i == gui_timestep.value
+                    )
 
             time.sleep(1.0 / gui_framerate.value)
 
