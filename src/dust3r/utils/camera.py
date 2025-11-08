@@ -450,54 +450,6 @@ def rotate_vector(q, v):
     return v_rot
 
 
-def rotation_6d_to_matrix(rot_6d: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 6D rotation representation to 3x3 rotation matrix.
-    Using proper Gram-Schmidt orthogonalization for numerical stability.
-    
-    Args:
-        rot_6d: (B, 6) tensor representing rotation as two 3D vectors
-        
-    Returns:
-        R: (B, 3, 3) rotation matrix
-    """
-    # Extract two 3D vectors
-    a1 = rot_6d[..., :3]   # First column (unnormalized)
-    a2 = rot_6d[..., 3:6]  # Second column (unnormalized)
-    
-    # Normalize first vector
-    b1 = F.normalize(a1, dim=-1, eps=1e-8)
-    
-    # Gram-Schmidt orthogonalization for second vector
-    # b2 = a2 - (a2 · b1) * b1
-    dot_product = torch.sum(b1 * a2, dim=-1, keepdim=True)
-    b2 = a2 - dot_product * b1
-    b2 = F.normalize(b2, dim=-1, eps=1e-8)
-    
-    # Cross product for third vector
-    b3 = torch.cross(b1, b2, dim=-1)
-    b3 = F.normalize(b3, dim=-1, eps=1e-8)
-    
-    # Stack to form rotation matrix
-    R = torch.stack([b1, b2, b3], dim=-1)  # (B, 3, 3)
-    return R
-
-
-def rotation_matrix_to_6d(R: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 3x3 rotation matrix to 6D rotation representation.
-    
-    Args:
-        R: (B, 3, 3) rotation matrix
-        
-    Returns:
-        rot_6d: (B, 6) 6D rotation representation (first two columns of R)
-    """
-    # Take the first two columns of the rotation matrix
-    rot_6d = R[..., :, :2].reshape(*R.shape[:-2], 6)  # (B, 3, 3) -> (B, 6)
-    return rot_6d
-
-
 def rotation_matrix_to_9d(R: torch.Tensor) -> torch.Tensor:
     """
     Convert 3x3 rotation matrix to 9D vector (flatten).

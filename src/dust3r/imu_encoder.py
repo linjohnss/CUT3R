@@ -114,8 +114,8 @@ class RelativePoseDecoder(nn.Module):
         super().__init__()
 
         self.pose_encoding_type = pose_encoding_type
-        # Directly predict 3 translation + 9 rotation matrix (flattened 3x3)
-        self.target_dim = 12
+        # Predict 3 translation + 6D rotation representation (two orthonormal basis vectors)
+        self.target_dim = 9
 
         self.mlp = Mlp(
             in_features=hidden_size,
@@ -140,54 +140,53 @@ class RelativePoseDecoder(nn.Module):
                 # Translation: initialize to zero
                 self.mlp.fc2.bias.data[:3] = 0.0
                 
-                # Rotation: initialize to identity matrix (flattened)
-                # [[1, 0, 0],
-                #  [0, 1, 0],
-                #  [0, 0, 1]]
-                identity_9d = torch.eye(3).reshape(9)
-                self.mlp.fc2.bias.data[3:12] = identity_9d
+                # Rotation (6D): initialize to identity's first two basis vectors
+                identity_6d = torch.tensor(
+                    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    device=self.mlp.fc2.bias.data.device,
+                    dtype=self.mlp.fc2.bias.data.dtype,
+                )
+                self.mlp.fc2.bias.data[3:9] = identity_6d
 
-    def orthogonalize_rotation(self, R):
+    def sixD_to_matrix(self, r):
         """
-        Orthogonalize rotation matrix using SVD (differentiable).
-        Ensures the output is a valid rotation matrix with det(R) = +1.
-        
-        Note: SVD and det operations don't support bfloat16 on CUDA,
-        so we wrap the entire computation in float32 context.
+        Convert 6D rotation representation to a proper rotation matrix using
+        Gram-Schmidt orthogonalization (Zhou et al., 2019).
         
         Args:
-            R: (B, 3, 3) potentially non-orthogonal matrices
+            r: (B, 3, 2) 6D rotation representation (two 3D vectors)
             
         Returns:
-            R_ortho: (B, 3, 3) orthogonalized rotation matrices
+            R_matrix: (B, 3, 3) orthonormal rotation matrices
         """
         # Save original dtype
-        original_dtype = R.dtype
-        
-        # Force float32 computation for all operations
+        original_dtype = r.dtype
+
+        # Force float32 computation for stability
         with torch.cuda.amp.autocast(enabled=False):
-            # Convert to float32
-            R_float = R.float()
-            
-            # SVD decomposition
-            U, _, Vh = torch.linalg.svd(R_float)
-            
-            # Reconstruct orthogonal matrix: R = U @ Vh
-            R_ortho = torch.bmm(U, Vh)
-            
-            # Ensure det(R) = +1 (proper rotation, not reflection)
-            det = torch.det(R_ortho)
-            
-            # If det is negative, flip the sign of the last column of Vh
-            Vh_corrected = Vh.clone()
-            Vh_corrected[:, -1, :] *= det.sign().view(-1, 1)
-            R_ortho = torch.bmm(U, Vh_corrected)
-        
-        # Convert back to original dtype if needed
-        if original_dtype == torch.bfloat16:
-            R_ortho = R_ortho.to(original_dtype)
-        
-        return R_ortho
+            r_float = r.float()
+
+            b1 = r_float[..., 0]
+            b2 = r_float[..., 1]
+
+            eps = 1e-6
+
+            b1_norm = torch.norm(b1, dim=-1, keepdim=True).clamp_min(eps)
+            b1 = b1 / b1_norm
+
+            proj_b2_on_b1 = (b1 * b2).sum(dim=-1, keepdim=True) * b1
+            b2 = b2 - proj_b2_on_b1
+            b2_norm = torch.norm(b2, dim=-1, keepdim=True).clamp_min(eps)
+            b2 = b2 / b2_norm
+
+            b3 = torch.cross(b1, b2, dim=-1)
+
+            R_matrix = torch.stack([b1, b2, b3], dim=-1)
+
+        if R_matrix.dtype != original_dtype:
+            R_matrix = R_matrix.to(original_dtype)
+
+        return R_matrix
 
     def forward(
         self,
@@ -200,17 +199,16 @@ class RelativePoseDecoder(nn.Module):
             pose_feat: (B, hidden_size) pose features
             
         Returns:
-            pred_pose: (B, 12) = (B, 3 translation + 9 rotation)
+            pred_pose: (B, 12) = (B, 3 translation + 9 rotation matrix elements)
         """
-        pred = self.mlp(pose_feat)  # Bx12
+        pred = self.mlp(pose_feat)  # (B, 9) = (B, 3 translation + 6 rotation)
         
         # Extract translation and rotation
         rel_trans = pred[:, :3]  # (B, 3)
-        rel_rot_9d = pred[:, 3:12]  # (B, 9)
-        
-        # Reshape to 3x3 matrix and orthogonalize
-        rel_rot_matrix = rel_rot_9d.reshape(-1, 3, 3)  # (B, 3, 3)
-        rel_rot_matrix = self.orthogonalize_rotation(rel_rot_matrix)  # (B, 3, 3)
+        rel_rot_6d = pred[:, 3:9].reshape(-1, 3, 2)  # (B, 3, 2)
+
+        # Convert 6D representation to rotation matrix
+        rel_rot_matrix = self.sixD_to_matrix(rel_rot_6d)  # (B, 3, 3)
         
         # Flatten back to 9D
         rel_rot_9d = rel_rot_matrix.reshape(-1, 9)  # (B, 9)
