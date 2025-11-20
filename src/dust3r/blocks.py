@@ -194,7 +194,16 @@ class CrossAttention(nn.Module):
 
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, attn_mask=None, return_attn_weights=False):
+        """
+        Args:
+            attn_mask: Optional[Tensor] - shape (B, Nq, Nk) or (B, num_heads, Nq, Nk)
+                       Values should be 0.0 (attend) or -inf (mask out)
+            return_attn_weights: bool - if True, return attention weights along with output
+        Returns:
+            x: output tensor
+            attn_weights: Optional[Tensor] - (B, num_heads, Nq, Nk) if return_attn_weights=True, else None
+        """
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
@@ -230,9 +239,19 @@ class CrossAttention(nn.Module):
                     k = self.rope(k, kpos)
                 k = k.to(k_type)
 
+        # Prepare attention mask
+        if attn_mask is not None:
+            # Ensure mask has correct shape: (B, num_heads, Nq, Nk)
+            if attn_mask.dim() == 3:  # (B, Nq, Nk)
+                attn_mask = attn_mask.unsqueeze(1)  # (B, 1, Nq, Nk)
+
+        # Compute attention
+        # CRITICAL FIX: Always use the optimized path to ensure identical numerical behavior
+        # Compute weights separately if needed (without affecting the forward pass)
         x = (
             scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                query=q, key=k, value=v, attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p, scale=self.scale
             )
             .transpose(1, 2)
             .reshape(B, Nq, C)
@@ -240,7 +259,20 @@ class CrossAttention(nn.Module):
 
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+
+        # If attention weights are requested, compute them WITHOUT affecting the forward pass
+        # This ensures the model behaves identically whether or not weights are requested
+        if return_attn_weights:
+            with torch.no_grad():  # Don't let this affect gradients of the main path
+                # Recompute attention scores (no dropout, for analysis only)
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+                if attn_mask is not None:
+                    attn_scores = attn_scores + attn_mask
+                # CRITICAL: Return logits (before softmax) to match TTT3R behavior
+                # TTT3R uses logits for computing state gates, not probabilities
+            return x, attn_scores.detach()  # Return detached logits (before softmax)
+        else:
+            return x, None
 
 
 class DecoderBlock(nn.Module):
@@ -289,12 +321,31 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
+    def forward(self, x, y, xpos, ypos, cross_attn_mask=None, return_cross_attn=False):
+        """
+        Args:
+            return_cross_attn: bool - if True, return cross-attention weights
+        Returns:
+            x: output tensor
+            y: key-value tensor (unchanged)
+            cross_attn_weights: Optional[Tensor] - cross-attention weights if return_cross_attn=True
+        """
         x = x + self.drop_path(self.attn(self.norm1(x), xpos))
         y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
+
+        # Cross-attention with optional weight return
+        cross_out, cross_attn_weights = self.cross_attn(
+            self.norm2(x), y_, y_, xpos, ypos,
+            attn_mask=cross_attn_mask,
+            return_attn_weights=return_cross_attn
+        )
+        x = x + self.drop_path(cross_out)
         x = x + self.drop_path(self.mlp(self.norm3(x)))
-        return x, y
+
+        if return_cross_attn:
+            return x, y, cross_attn_weights
+        else:
+            return x, y
 
 
 class CustomDecoderBlock(nn.Module):

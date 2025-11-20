@@ -398,6 +398,7 @@ class CUT3RIMU(nn.Module):
             global_img_feat_i = self.cut3r_model._get_img_level_feat(feat_i)
             if i == 0:
                 self.prev_pose_token = None
+                self.prev_state_attn_gate = None  # 初始化前一幀的 attention gate
                 # Initialize with identity rotation (as 9D vector)
                 current_trans = torch.zeros(feat_i.shape[0], 3, device=feat_i.device, dtype=feat_i.dtype)
                 current_rot_matrix = torch.eye(3, device=feat_i.device, dtype=feat_i.dtype).unsqueeze(0).expand(feat_i.shape[0], -1, -1)  # (B, 3, 3)
@@ -419,15 +420,26 @@ class CUT3RIMU(nn.Module):
             rel_pose_pos_i = -torch.ones(
                 feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
             )
-
+            
+            rel_pose_attn_mask = None
+            if i > 0 and self.prev_state_attn_gate is not None:
+                threshold = 0.5
+                mask = torch.where(
+                    self.prev_state_attn_gate.unsqueeze(1) > threshold,
+                    torch.zeros_like(self.prev_state_attn_gate.unsqueeze(1)),
+                    torch.full_like(self.prev_state_attn_gate.unsqueeze(1), float('-inf'))
+                )
+                rel_pose_attn_mask = mask  # [B, 1, n_state]
+            
         else:
             pose_feat_i = None
             pose_pos_i = None
             rel_pose_feat_i = None
             rel_pose_pos_i = None
+            rel_pose_attn_mask = None
         
-        # Decoder rollout (傳入準備好的 relative_pose_token)
-        new_state_feat, dec = self._recurrent_rollout(
+        # Decoder rollout (傳入準備好的 relative_pose_token 和 attention mask)
+        new_state_feat, dec, state_gate = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -440,7 +452,12 @@ class CUT3RIMU(nn.Module):
             update=None,
             rel_pose_feat=rel_pose_feat_i,
             rel_pose_pos=rel_pose_pos_i,
+            rel_pose_attn_mask=rel_pose_attn_mask,
+            return_state_gate=True,
         )
+        
+        if state_gate is not None:
+            self.prev_state_attn_gate = state_gate.detach()
 
         # 從 decoder 輸出中提取更新後的 pose token
         out_pose_feat_i = dec[-1][:, 0:1]  # 使用 rollout 後的 pose token
@@ -468,7 +485,7 @@ class CUT3RIMU(nn.Module):
             # 將 decode 完的 relative pose token 作為 decoder 的輸入
             relative_pose = self.relative_pose_decoder(
                 pose_feat=decoded_relative_pose_token  # [B, D]
-            )  # (B, 12) = (B, 3 + 9) - 已經過 SVD 正交化
+            )
                         
             # 位姿累加邏輯 (使用 9D rotation matrix)
             # Loss 中定義: R_rel = R_curr^T @ R_prev (backward definition)
@@ -565,13 +582,16 @@ class CUT3RIMU(nn.Module):
         """
         return self.cut3r_model._get_img_level_feat(feat)
     
-    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, f_rel_pose=None, pos_rel_pose=None):
+    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, f_rel_pose=None, pos_rel_pose=None, rel_pose_attn_mask=None, return_attn=False):
         """
         自定義的 decoder，接收外部準備好的 relative_pose_token
         
         Args:
             f_rel_pose: [B, 1, dec_embed_dim] - 準備好的 relative pose token feature
             pos_rel_pose: [B, 1, 2] - relative pose token 的位置編碼
+            rel_pose_attn_mask: Optional[Tensor] - [B, 1, n_state] attention mask for rel_pose_token
+                                只讓 rel_pose_token 跟前一幀相關的 state feature 做 attention
+            return_attn: bool - 是否回傳 cross-attention maps（用於計算 state gate）
         """
         final_output = [(f_state, f_img)]  # before projection
         assert f_state.shape[-1] == self.dec_embed_dim
@@ -580,7 +600,8 @@ class CUT3RIMU(nn.Module):
         f_img = self.cut3r_model.decoder_embed(f_img)  # [B, N, enc_embed_dim] -> [B, N, dec_embed_dim]
         
         # 2. 如果提供了 relative_pose_token，concat 到 f_img 後面
-        if f_rel_pose is not None and pos_rel_pose is not None:
+        has_rel_pose = f_rel_pose is not None and pos_rel_pose is not None
+        if has_rel_pose:
             f_img = torch.cat([f_img, f_rel_pose], dim=1)  # [B, N+1, dec_embed_dim]
             pos_img = torch.cat([pos_img, pos_rel_pose], dim=1)  # [B, N+1, 2]
         
@@ -592,13 +613,33 @@ class CUT3RIMU(nn.Module):
         
         final_output.append((f_state, f_img))
         
+        # 收集 cross-attention maps (用於計算 state gate)
+        cross_attn_state_maps = [] if return_attn else None
+
         # 5. Decoder blocks
         for blk_state, blk_img in zip(self.cut3r_model.dec_blocks_state, self.cut3r_model.dec_blocks):
+            # 為 image decoder block 準備 cross-attention mask (image tokens attend to state)
+            # f_img shape: [B, n_img_tokens, D] where n_img_tokens = 1(pose) + N(img) + 1(rel_pose)
+            # f_state shape: [B, n_state, D]
+            # 只需要為最後一個 token (rel_pose_token) 應用 mask
+            img_cross_attn_mask = None
+            if has_rel_pose and rel_pose_attn_mask is not None:
+                # rel_pose_attn_mask: [B, 1, n_state] - 只針對 rel_pose token
+                # 需要擴展成 [B, n_img_tokens, n_state]，其他 token 不加 mask
+                B, n_img_tokens, _ = f_img.shape
+                n_state = f_state.shape[1]
+                # 創建全零 mask (允許所有 attention)
+                img_cross_attn_mask = torch.zeros(B, n_img_tokens, n_state,
+                                                   device=f_img.device, dtype=f_img.dtype)
+                # 將最後一個 token (rel_pose) 的 mask 設置為提供的 mask
+                img_cross_attn_mask[:, -1:, :] = rel_pose_attn_mask
+
             if (
                 self.cut3r_model.gradient_checkpointing
                 and self.training
                 and torch.is_grad_enabled()
             ):
+                # Note: gradient checkpointing 時無法回傳 attention，此時 return_attn 應為 False
                 f_state, _ = checkpoint(
                     blk_state,
                     *final_output[-1][::+1],
@@ -614,8 +655,22 @@ class CUT3RIMU(nn.Module):
                     use_reentrant=not self.cut3r_model.fixed_input_length,
                 )
             else:
-                f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
-                f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
+                # blk_state: state tokens attend to image (cross-attn from state to image)
+                # 我們需要這個 attention map 來計算 gate
+                if return_attn:
+                    # 真正回傳 cross-attention weights
+                    f_state, _, state_cross_attn = blk_state(
+                        *final_output[-1][::+1], pos_state, pos_img,
+                        return_cross_attn=True
+                    )
+                    # state_cross_attn: (B, num_heads, n_state, n_img)
+                    # 收集這些 attention maps 用於後續計算 gate
+                    cross_attn_state_maps.append(state_cross_attn)
+                else:
+                    f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
+
+                # blk_img: image tokens attend to state, 使用 cross_attn_mask
+                f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state, cross_attn_mask=img_cross_attn_mask)
             final_output.append((f_state, f_img))
         
         del final_output[1]  # duplicate with final_output[0]
@@ -623,7 +678,10 @@ class CUT3RIMU(nn.Module):
             self.cut3r_model.dec_norm_state(final_output[-1][0]),
             self.cut3r_model.dec_norm(final_output[-1][1]),
         )
-        return zip(*final_output)
+        
+        if return_attn:
+            return zip(*final_output), cross_attn_state_maps
+        return zip(*final_output), None
     
     def _recurrent_rollout(
         self,
@@ -639,18 +697,54 @@ class CUT3RIMU(nn.Module):
         update=None,
         rel_pose_feat=None,  # 新增：relative pose token feature
         rel_pose_pos=None,   # 新增：relative pose token position
+        rel_pose_attn_mask=None,  # 新增：attention mask for rel_pose_token
+        return_state_gate=False,  # 是否回傳當前幀的 state gate
     ):
         """
-        使用自定義的 _decoder，傳遞 relative_pose_token
+        使用自定義的 _decoder，傳遞 relative_pose_token 和對應的 attention mask
         """
-        new_state_feat, dec = self._decoder(
+        decoder_output, cross_attn = self._decoder(
             state_feat, state_pos, current_feat, current_pos, 
             pose_feat, pose_pos,
             f_rel_pose=rel_pose_feat,
-            pos_rel_pose=rel_pose_pos
+            pos_rel_pose=rel_pose_pos,
+            rel_pose_attn_mask=rel_pose_attn_mask,
+            return_attn=return_state_gate
         )
-        new_state_feat = new_state_feat[-1]
-        return new_state_feat, dec
+        # decoder_output 是 zip(*final_output) 的結果，會產生兩個 iterator
+        # 第一個 iterator 是所有層的 state，第二個是所有層的 img
+        state_outputs, img_outputs = decoder_output
+        state_outputs = list(state_outputs)
+        img_outputs = list(img_outputs)
+        
+        new_state_feat = state_outputs[-1]  # 最後一層的 state
+        dec = img_outputs  # decoder 的 image outputs
+        
+        # 計算當前幀的 state gate（用於下一幀）
+        state_gate = None
+        if return_state_gate and cross_attn is not None and len(cross_attn) > 0:
+            # 只使用最後一層的 cross-attention 計算 state gate
+            # cross_attn 是一個 list，每個元素是一個 decoder layer 的 attention logits (softmax 前)
+            # 每個 attention map: (B, num_heads, n_state, n_img)
+
+            # 取最後一層（靠近最終 state）
+            last_layer_attn = cross_attn[-1]  # (B, num_heads, n_state, n_img)
+
+            # 對 image-token 維度做 softmax，得到每個 state 對各 image-token 的 attention probability
+            # 這樣可以直接取到指向 relative_pose token 的機率值
+            attn_probs = torch.softmax(last_layer_attn, dim=-1)  # (B, num_heads, n_state, n_img)
+
+            # 假設 relative_pose token 被 concat 在 image tokens 的最後一個位置，選取最後一列
+            rel_token_idx = -1
+            attn_to_rel = attn_probs[..., rel_token_idx]  # (B, num_heads, n_state)
+
+            # 對 heads 平均得到每個 state 對 relative_pose token 的關聯機率
+            avg_attn_to_rel = attn_to_rel.mean(dim=1)  # (B, n_state)
+
+            # 直接使用機率作為 gate（值域在 [0,1]）
+            state_gate = avg_attn_to_rel
+
+        return new_state_feat, dec, state_gate
     
     def _downstream_head(self, *args, **kwargs):
         """
