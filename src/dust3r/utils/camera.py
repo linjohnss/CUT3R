@@ -476,6 +476,49 @@ def rotation_9d_to_matrix(rot_9d: torch.Tensor) -> torch.Tensor:
     return rot_9d.reshape(*rot_9d.shape[:-1], 3, 3)
 
 
+def pose_12d_to_matrix(pose_12d: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 12D pose representation (3 translation + 9D rotation) to 4x4 matrix.
+
+    Args:
+        pose_12d: (..., 12) where last 12 = [tx, ty, tz, rot_9d]
+
+    Returns:
+        T: (..., 4, 4) SE(3) matrix
+    """
+    from dust3r.utils.camera import rotation_9d_to_matrix
+
+    trans = pose_12d[..., :3]
+    rot_9d = pose_12d[..., 3:12]
+    R = rotation_9d_to_matrix(rot_9d)
+
+    T = torch.eye(4, device=pose_12d.device, dtype=pose_12d.dtype)
+    # Broadcast to batch by expanding
+    expand_shape = (*pose_12d.shape[:-1], 4, 4)
+    T = T.expand(expand_shape).clone()
+    T[..., :3, :3] = R
+    T[..., :3, 3] = trans
+    return T
+
+
+def pose_matrix_to_12d(T: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 4x4 pose matrix to 12D representation (3 translation + 9D rotation).
+
+    Args:
+        T: (..., 4, 4) SE(3) matrix
+
+    Returns:
+        pose_12d: (..., 12) where last 12 = [tx, ty, tz, rot_9d]
+    """
+    from dust3r.utils.camera import rotation_matrix_to_9d
+
+    trans = T[..., :3, 3]
+    R = T[..., :3, :3]
+    rot_9d = rotation_matrix_to_9d(R)
+    return torch.cat([trans, rot_9d], dim=-1)
+
+
 def relative_pose_absT_quatR(t1, q1, t2, q2):
     """Compute the relative translation and quaternion between two poses."""
 

@@ -87,7 +87,11 @@ def get_imu_parameter_groups(model, weight_decay, args):
         # CRITICAL FIX: Only include parameters that are actually trainable (requires_grad=True)
         # and belong to IMU components
         # IMPORTANT: Include relative_pose_token which is a learnable parameter for relative pose estimation
-        if any(imu_keyword in name for imu_keyword in ['imu_encoder', 'pose_transformer', 'relative_pose_decoder', 'relative_pose_token']):
+        # IMPORTANT: Include reset_gate and update_gate for state update control
+        if any(imu_keyword in name for imu_keyword in [
+            'imu_encoder', 'pose_transformer', 'relative_pose_decoder', 
+            'relative_pose_token', 'reset_gate', 'update_gate'
+        ]):
             imu_params.append((name, param))
         else:
             # This should not happen if CUT3R parameters are properly frozen
@@ -299,6 +303,9 @@ def save_current_code(outdir):
 def create_imu_enhanced_model(base_model, imu_config):
     """Create IMU-enhanced CUT3R model if IMU config is provided"""
     if imu_config:
+        # Convert OmegaConf to dict if needed
+        if hasattr(imu_config, '_content'):
+            imu_config = OmegaConf.to_container(imu_config, resolve=True)
         return CUT3RIMU(base_model, imu_config)
     else:
         # Return original model if no IMU config
@@ -368,6 +375,10 @@ def train(args):
     model = create_imu_enhanced_model(base_model, imu_config)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
     
+    # Print gating status if model has use_gating attribute
+    if hasattr(model, 'use_gating'):
+        printer.info(f"Gating mechanism: {'Enabled' if model.use_gating else 'Disabled'}")
+    
     # Load pretrained weights if available (before state precomputation)
     if args.pretrained and not args.resume:
         from dust3r.model import strip_module
@@ -435,7 +446,8 @@ def train(args):
         printer.info(f"Original train_dataset_str: {train_dataset_str}")
         printer.info(f"train_dataset_str type: {type(train_dataset_str)}")
         printer.info(f"train_dataset_str repr: {repr(train_dataset_str)}")
-        # Add model to extra context for eval()
+        # Add FULL MODEL (CUT3RIMU) to extra context for eval()
+        # CRITICAL: Pass the full CUT3RIMU model instead of base model to ensure relative_pose_token is included
         extra_context['model'] = model
         
         # Inject precompute parameters into dataset string
@@ -556,6 +568,13 @@ def train(args):
     loss_scaler = NativeScaler(accelerator=accelerator)
 
     accelerator.even_batches = False
+    
+    # CRITICAL: Store reference to unwrapped dataset for state recomputation
+    # After accelerator.prepare(), the dataset will be wrapped and hard to access
+    train_dataset_unwrapped = None
+    if hasattr(data_loader_train, 'dataset'):
+        train_dataset_unwrapped = data_loader_train.dataset
+    
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
@@ -604,6 +623,14 @@ def train(args):
             # Save relative pose token if it exists (it's a Parameter, not a module)
             if hasattr(actual_model, 'relative_pose_token'):
                 imu_state_dict['relative_pose_token'] = actual_model.relative_pose_token
+
+            # Save reset gate weights (only if gating is enabled)
+            if hasattr(actual_model, 'reset_gate') and actual_model.reset_gate is not None:
+                imu_state_dict['reset_gate'] = actual_model.reset_gate.state_dict()
+            
+            # Save update gate weights (only if gating is enabled)
+            if hasattr(actual_model, 'update_gate') and actual_model.update_gate is not None:
+                imu_state_dict['update_gate'] = actual_model.update_gate.state_dict()
 
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
@@ -687,7 +714,56 @@ def train(args):
             args=args,
             slack_notifier=slack_notifier,
             slack_config=slack_config,
+            train_dataset_unwrapped=train_dataset_unwrapped,
         )
+        
+        # Periodic state recomputation to align with updated model (epoch-based)
+        precompute_recompute_interval = getattr(args, 'precompute_recompute_interval', None)
+        if (precompute_recompute_interval is not None and 
+            precompute_recompute_interval > 0 and
+            epoch > 0 and
+            epoch % precompute_recompute_interval == 0 and
+            accelerator.is_main_process):
+            
+            printer.info(f"\n{'='*80}")
+            printer.info(f"🔄 Triggering state recomputation after epoch {epoch}")
+            printer.info(f"{'='*80}\n")
+            
+            try:
+                # Get the unwrapped model (actual CUT3RIMU instance)
+                actual_model = accelerator.unwrap_model(model)
+                
+                # Unwrap dataset layers to find the actual dataset with recompute_states
+                def find_recomputable_dataset(ds):
+                    """Recursively unwrap dataset to find one with recompute_states method"""
+                    if ds is None:
+                        return None
+                    if hasattr(ds, 'recompute_states'):
+                        return ds
+                    # Check if wrapped by ResizedDataset, MulDataset, etc.
+                    if hasattr(ds, 'dataset'):
+                        return find_recomputable_dataset(ds.dataset)
+                    # Check if CatDataset (has multiple datasets)
+                    if hasattr(ds, 'datasets'):
+                        for inner_ds in ds.datasets:
+                            result = find_recomputable_dataset(inner_ds)
+                            if result is not None:
+                                return result
+                    return None
+                
+                recomputable_dataset = find_recomputable_dataset(train_dataset_unwrapped)
+                
+                if recomputable_dataset is not None:
+                    printer.info(f"Found recomputable dataset: {type(recomputable_dataset).__name__}")
+                    recomputable_dataset.recompute_states(actual_model)
+                    printer.info("✅ State recomputation completed successfully")
+                else:
+                    printer.warning(f"⚠️ Could not find dataset with recompute_states method")
+            except Exception as e:
+                printer.error(f"❌ Error during state recomputation: {e}")
+                import traceback
+                traceback.print_exc()
+
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -771,6 +847,14 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
             if hasattr(actual_model, 'relative_pose_token'):
                 imu_state_dict['relative_pose_token'] = actual_model.relative_pose_token
             
+            # Save reset gate weights (only if gating is enabled)
+            if hasattr(actual_model, 'reset_gate') and actual_model.reset_gate is not None:
+                imu_state_dict['reset_gate'] = actual_model.reset_gate.state_dict()
+            
+            # Save update gate weights (only if gating is enabled)
+            if hasattr(actual_model, 'update_gate') and actual_model.update_gate is not None:
+                imu_state_dict['update_gate'] = actual_model.update_gate.state_dict()
+            
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
             imu_params = 0
@@ -823,6 +907,7 @@ def train_one_epoch(
     log_writer=None,
     slack_notifier=None,
     slack_config=None,
+    train_dataset_unwrapped=None,
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
@@ -867,6 +952,14 @@ def train_one_epoch(
             # Save relative pose token if it exists (it's a Parameter, not a module)
             if hasattr(actual_model, 'relative_pose_token'):
                 imu_state_dict['relative_pose_token'] = actual_model.relative_pose_token
+            
+            # Save reset gate weights (only if gating is enabled)
+            if hasattr(actual_model, 'reset_gate') and actual_model.reset_gate is not None:
+                imu_state_dict['reset_gate'] = actual_model.reset_gate.state_dict()
+            
+            # Save update gate weights (only if gating is enabled)
+            if hasattr(actual_model, 'update_gate') and actual_model.update_gate is not None:
+                imu_state_dict['update_gate'] = actual_model.update_gate.state_dict()
             
             torch.save(imu_state_dict, imu_path)
             # Count parameters correctly by flattening nested state dicts
@@ -1549,6 +1642,24 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
 )
 def run(cfg: OmegaConf):
     OmegaConf.resolve(cfg)
+    
+    # Handle deterministic mode
+    deterministic = getattr(cfg, 'deterministic', False)
+    if deterministic:
+        print("Enabling deterministic mode...")
+        # Set deterministic algorithms
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        
+        # Set seed if not already set (though train() sets it too, setting it early is good)
+        seed = getattr(cfg, 'seed', 42)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        print(f"Deterministic mode enabled with seed {seed}")
+
     logdir = pathlib.Path(cfg.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
     train(cfg)

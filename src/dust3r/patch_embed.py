@@ -86,8 +86,13 @@ class ManyAR_PatchEmbed(PatchEmbed):
             .float()
         )
 
-        pos[is_landscape] = self.position_getter(1, H, W, pos.device)
-        pos[is_portrait] = self.position_getter(1, W, H, pos.device)
+        n_landscape = int(is_landscape.sum())
+        if n_landscape > 0:
+            pos[is_landscape] = self.position_getter(n_landscape, H, W, pos.device)
+            
+        n_portrait = int(is_portrait.sum())
+        if n_portrait > 0:
+            pos[is_portrait] = self.position_getter(n_portrait, W, H, pos.device)
 
         x = self.norm(x)
         return x, pos

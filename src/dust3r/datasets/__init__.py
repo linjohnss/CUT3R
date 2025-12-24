@@ -62,6 +62,13 @@ def get_data_loader(
         else:
             dataset = eval(dataset)
 
+    def seed_worker(worker_id):
+        import numpy as np
+        import random
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
     try:
         sampler = dataset.make_sampler(
             batch_size,
@@ -77,6 +84,7 @@ def get_data_loader(
             batch_sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_mem,
+            worker_init_fn=seed_worker,
         )
 
     except (AttributeError, NotImplementedError):
@@ -89,6 +97,7 @@ def get_data_loader(
             num_workers=num_workers,
             pin_memory=pin_mem,
             drop_last=drop_last,
+            worker_init_fn=seed_worker,
         )
 
     return data_loader

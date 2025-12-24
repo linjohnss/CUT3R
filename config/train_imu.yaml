@@ -3,7 +3,7 @@
 
 # Training mode configuration (NEW - flexible training options)
 training_mode:
-  enable_lora: false         # Disable LoRA training  
+  enable_lora: false         # Disable LoRA training
   enable_imu: true           # Enable IMU training
   freeze_cut3r: true         # Freeze CUT3R base model (only train IMU components)
 
@@ -20,6 +20,8 @@ fixed_length: True
 resume: null
 benchmark: False
 precompute_states: True  # Enable to precompute recurrent states for all scenes before training
+precompute_recompute_interval: 10  # Recompute states every N epochs using updated model with relative_pose_token
+deterministic: False     # Enable for deterministic training (slower but reproducible)
 
 # Data configuration (same as finetune_kitti_lora.yaml)
 num_views: 4  # Reduced from 32 for IMU training
@@ -33,17 +35,17 @@ test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_va
 resolution: [(512, 384)]
 
 allow_repeat: False
-dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, aug_crop=0, resolution=[(512, 384)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, frame_range=(0, 200), demo_compatible=True)
+dataset1: KITTI_Multi(allow_repeat=${allow_repeat}, ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, aug_crop=0, resolution=[(512, 384)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, frame_range=(0, 1000), demo_compatible=True)
 
 
-train_dataset: 200 @ ${dataset1}
+train_dataset: 1000 @ ${dataset1}
 test_dataset: 10 @ KITTI_Multi(ROOT='../../dataset/dust3r_data/processed_kitti', scenes=['kitti_00'], load_imu=${training_mode.enable_imu}, resolution=(512, 384), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
 seed: 0
 batch_size: 2
 accum_iter: 1
 gradient_checkpointing: False
-epochs: 300
+epochs: 1000
 start_epoch: 0
 weight_decay: 0.05
 lr: 1e-4
@@ -65,10 +67,10 @@ gpu: 0
 distributed: True
 dist_backend: 'nccl'
 
-eval_freq: 10
-save_freq: 10
-keep_freq: 10
-print_freq: 10
+eval_freq: 100
+save_freq: 100
+keep_freq: 100
+print_freq: 100
 print_img_freq: 50000000
 num_imgs_vis: 4
 
@@ -90,6 +92,7 @@ imu_config:
   input_dim: 6              # IMU 6-axis (acc + gyro)
   seq_len: 10               # IMU sequence length per frame
   dropout: 0.0              # IMU encoder dropout
+  use_gating: true           # Enable/disable gating mechanism (reset_gate and update_gate)
 
 # Slack notification configuration (NEW - for training notifications)
 slack:

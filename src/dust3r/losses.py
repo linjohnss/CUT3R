@@ -481,8 +481,8 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_pts_self = [pts / norm_factor_pr for pts in pr_pts_self]
         pr_pts_cross = [pts / norm_factor_pr for pts in pr_pts_cross]
 
-        # Convert GT poses to 9D rotation matrix format
-        # GT camera_pose is 4x4 matrix, convert to (trans, rot_9d) format
+        # Convert GT & predicted poses to (trans, rot_9d) format
+        # Support both legacy (B, 12) = (3 + 9) and new (B, 4, 4) SE(3) formats
         from dust3r.utils.camera import rotation_matrix_to_9d
         
         gt_poses = []
@@ -497,9 +497,18 @@ class Regr3DPose(Criterion, MultiLoss):
         # Predicted poses are already in (trans, rot_9d) format from imu_encoder
         pr_poses = []
         for pred in preds:
-            # pred["camera_pose"] is (B, 12) = (B, 3 + 9)
-            trans = pred["camera_pose"][:, :3]  # (B, 3)
-            rot_9d = pred["camera_pose"][:, 3:12]  # (B, 9)
+            cam_pose = pred.get("camera_pose", None)
+            if cam_pose is None:
+                continue
+            if cam_pose.ndim == 3 and cam_pose.shape[-2:] == (4, 4):
+                # New SE(3) format (B, 4, 4)
+                trans = cam_pose[:, :3, 3]
+                rot_mat = cam_pose[:, :3, :3]
+                rot_9d = rotation_matrix_to_9d(rot_mat)
+            else:
+                # Legacy (B, 12) = (3 + 9)
+                trans = cam_pose[:, :3]
+                rot_9d = cam_pose[:, 3:12]
             pr_poses.append((trans.clone(), rot_9d.clone()))
             
         pose_norm_factor_gt = norm_factor_gt.clone().squeeze(2, 3)
@@ -655,7 +664,7 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_pts_self = [pts / norm_factor_pr for pts in pr_pts_self]
         pr_pts_cross = [pts / norm_factor_pr for pts in pr_pts_cross]
 
-        # Convert GT poses to 9D rotation matrix format
+        # Convert GT & predicted poses to (trans, rot_9d) format
         from dust3r.utils.camera import rotation_matrix_to_9d
         
         gt_poses = []
@@ -666,11 +675,18 @@ class Regr3DPose(Criterion, MultiLoss):
             rot_9d = rotation_matrix_to_9d(rot_mat)  # (B, 9)
             gt_poses.append((trans.clone(), rot_9d.clone()))
         
-        # Predicted poses are already in (trans, rot_9d) format
         pr_poses = []
         for pred in preds:
-            trans = pred["camera_pose"][:, :3]  # (B, 3)
-            rot_9d = pred["camera_pose"][:, 3:12]  # (B, 9)
+            cam_pose = pred.get("camera_pose", None)
+            if cam_pose is None:
+                continue
+            if cam_pose.ndim == 3 and cam_pose.shape[-2:] == (4, 4):
+                trans = cam_pose[:, :3, 3]
+                rot_mat = cam_pose[:, :3, :3]
+                rot_9d = rotation_matrix_to_9d(rot_mat)
+            else:
+                trans = cam_pose[:, :3]
+                rot_9d = cam_pose[:, 3:12]
             pr_poses.append((trans.clone(), rot_9d.clone()))
             
         pose_norm_factor_gt = norm_factor_gt.clone().squeeze(2, 3)
@@ -810,12 +826,13 @@ class Regr3DPose(Criterion, MultiLoss):
         pr_t_rel = torch.bmm(pr_R2.transpose(-2, -1), delta_trans_pr.unsqueeze(-1)).squeeze(-1)
         
         # Compute losses
-        rel_trans_err = torch.norm(gt_t_rel - pr_t_rel, dim=-1)
+        # Compute MAE (Mean Absolute Error) of translation error for each pair
+        rel_trans_err = torch.abs(gt_t_rel - pr_t_rel).mean(dim=-1)
         
         # For rotation, use Frobenius norm of the difference
-        rel_rot_err = torch.norm(gt_R_rel - pr_R_rel, dim=(-2, -1))  # Frobenius norm
+        rel_rot_err = torch.abs(gt_R_rel - pr_R_rel)  # Frobenius norm
         
-        return rel_trans_err.mean() + rel_rot_err.mean() 
+        return rel_trans_err.mean() + rel_rot_err.mean()
 
     def compute_pose_loss(self, gt_poses, pred_poses, masks=None):
         """
@@ -824,25 +841,55 @@ class Regr3DPose(Criterion, MultiLoss):
         Args:
             gt_pose: list of (Bx3, Bx9) - (translation, 9D rotation matrix)
             pred_pose: list of (Bx3, Bx9) - (translation, 9D rotation matrix)
-        masks: None, or B
+        masks: None, or tensor (B, ...) - boolean mask
         """
         gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
         gt_rots_9d = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BxNx9
         pred_trans = torch.stack([pr[0] for pr in pred_poses], dim=1)  # BxNx3
         pred_rots_9d = torch.stack([pr[1] for pr in pred_poses], dim=1)  # BxNx9
         
-        if masks == None:
+        if masks is None:
             pose_loss = (
                 torch.norm(pred_trans - gt_trans, dim=-1).mean()
                 + torch.norm(pred_rots_9d - gt_rots_9d, dim=-1).mean() 
             )
         else:
-            if not any(masks):
-                return torch.tensor(0.0)
-            pose_loss = (
-                torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
-                + torch.norm(pred_rots_9d - gt_rots_9d, dim=-1)[masks].mean() 
-            )
+            # Check if masks has any True values (handle tensor properly)
+            if isinstance(masks, torch.Tensor):
+                if masks.numel() == 0 or not masks.any():
+                    return torch.tensor(0.0, device=gt_trans.device, dtype=gt_trans.dtype)
+            elif isinstance(masks, (list, tuple)):
+                # If masks is a list/tuple, check if any element has True values
+                if len(masks) == 0:
+                    return torch.tensor(0.0, device=gt_trans.device, dtype=gt_trans.dtype)
+                # Check if any mask in the list has True values
+                has_valid_mask = False
+                for mask in masks:
+                    if isinstance(mask, torch.Tensor) and mask.any():
+                        has_valid_mask = True
+                        break
+                if not has_valid_mask:
+                    return torch.tensor(0.0, device=gt_trans.device, dtype=gt_trans.dtype)
+            else:
+                # Fallback for other types
+                if not masks:
+                    return torch.tensor(0.0, device=gt_trans.device, dtype=gt_trans.dtype)
+            
+            # Handle masks with shape [B, N] for indexing [B, N, 3] tensors
+            if isinstance(masks, torch.Tensor) and masks.ndim == 2:
+                # masks is [B, N], pred_trans/gt_trans are [B, N, 3]
+                # Apply mask to select valid (batch, view) pairs
+                masked_trans_diff = torch.norm(pred_trans - gt_trans, dim=-1)  # [B, N]
+                masked_rot_diff = torch.norm(pred_rots_9d - gt_rots_9d, dim=-1)  # [B, N]
+                pose_loss = (
+                    masked_trans_diff[masks].mean() + masked_rot_diff[masks].mean()
+                )
+            else:
+                # Fallback for 1D masks or other formats
+                pose_loss = (
+                    torch.norm(pred_trans - gt_trans, dim=-1)[masks].mean()
+                    + torch.norm(pred_rots_9d - gt_rots_9d, dim=-1)[masks].mean() 
+                )
 
         return pose_loss
 
@@ -973,6 +1020,9 @@ class Regr3DPoseBatchList(Regr3DPose):
         self.single_view_criterion = ScaleInvLoss()
 
     def reorg(self, ls_b, masks_b):
+        # Handle empty masks_b case (e.g., when all camera_only=True)
+        if len(masks_b) == 0:
+            return []
         ids_split = [mask.sum(dim=(1, 2)) for mask in masks_b]
         ls = [[] for _ in range(len(masks_b[0]))]
         for i in range(len(ls_b)):
@@ -1015,32 +1065,30 @@ class Regr3DPoseBatchList(Regr3DPose):
         else:
             all_camera_only = bool(np.all(camera_only))
 
-        if all_camera_only:
-            details = {}
-            pose_loss = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
-            details["pose_loss"] = pose_loss
+        # Compute relative_pose_token_loss if relative_pose is available in predictions
+        # This is independent of camera_only mode - computed whenever pose_head=True
+        def compute_relative_pose_token_loss(gt_poses, preds):
+            """Compute relative pose token loss from predictions.
             
-            gt_trans = torch.stack([gt[0] for gt in gt_poses], dim=1)  # BxNx3
-            gt_rots_9d = torch.stack([gt[1] for gt in gt_poses], dim=1)  # BxNx9
-            pr_trans = torch.stack([pr[0] for pr in pr_poses], dim=1)  # BxNx3
-            pr_rots_9d = torch.stack([pr[1] for pr in pr_poses], dim=1)  # BxNx9
-
-            rel_pose_loss = self.compute_relative_pose_loss(
-                gt_trans, gt_rots_9d, pr_trans, pr_rots_9d, masks=None
-            )
-            details["relative_pose_loss"] = rel_pose_loss
-
+            Args:
+                gt_poses: List of tuples (trans, rot_9d) for each view
+                preds: List of prediction dictionaries
+                
+            Returns:
+                avg_relative_pose_token_loss: Average relative pose token loss
+                loss_value: Float value for logging
+            """
             relative_pose_token_losses = []
             for i in range(1, len(preds)):
                 # 檢查是否有 relative_pose
                 if "relative_pose" not in preds[i]:
                     continue
                     
-                pred_rel_pose = preds[i]["relative_pose"]  # (B, 12) = (B, 3 + 9)
+                pred_rel_pose = preds[i]["relative_pose"]  # (B, 4, 4) SE(3) matrix
                 
                 # 使用 GT pose 計算 relative pose 作為監督目標
                 # gt_poses[i] 是一個元組 (trans, rot_9d)
-                from dust3r.utils.camera import rotation_9d_to_matrix, rotation_matrix_to_9d
+                from dust3r.utils.camera import rotation_9d_to_matrix
                 
                 gt_trans_prev = gt_poses[i-1][0]  # (B, 3)
                 gt_rot_9d_prev = gt_poses[i-1][1]  # (B, 9)
@@ -1058,33 +1106,44 @@ class Regr3DPoseBatchList(Regr3DPose):
                 delta_trans = gt_trans_prev - gt_trans_curr
                 gt_rel_trans = torch.bmm(gt_R_curr.transpose(-2, -1), delta_trans.unsqueeze(-1)).squeeze(-1)  # (B, 3)
                 
-                # 將 GT relative rotation matrix 展平為 9D
-                gt_rel_rot_9d = rotation_matrix_to_9d(gt_R_rel)  # (B, 9)
+                # 提取預測的 relative pose (pred_rel_pose 是 4x4 矩陣)
+                pred_rel_trans = pred_rel_pose[:, :3, 3]  # (B, 3)
+                pred_rel_rot_matrix = pred_rel_pose[:, :3, :3]  # (B, 3, 3) - 直接提取 rotation matrix
                 
-                # 提取預測的 relative pose
-                pred_rel_trans = pred_rel_pose[:, :3]  # (B, 3)
-                pred_rel_rot_9d = pred_rel_pose[:, 3:12]  # (B, 9)
-                
-                # 計算相對姿態loss（直接在 9D rotation matrix 空間計算）
+                # 計算相對姿態loss（直接在 rotation matrix 空間計算）
                 rel_pose_token_loss = (
-                    torch.norm(pred_rel_trans - gt_rel_trans, dim=-1).mean() +
-                    torch.norm(pred_rel_rot_9d - gt_rel_rot_9d, dim=-1).mean() 
+                    torch.abs(pred_rel_trans - gt_rel_trans).mean() +
+                    torch.abs(pred_rel_rot_matrix - gt_R_rel).mean() * 40.0
                 )
-                
+
                 relative_pose_token_losses.append(rel_pose_token_loss)
             
             if relative_pose_token_losses:
                 avg_relative_pose_token_loss = torch.stack(relative_pose_token_losses).mean()
-                details["relative_pose_token_loss"] = float(avg_relative_pose_token_loss.item())
+                loss_value = float(avg_relative_pose_token_loss.item())
             else:
                 avg_relative_pose_token_loss = torch.tensor(0.0, device=gt_poses[0][0].device)
-                details["relative_pose_token_loss"] = 0.0
+                loss_value = 0.0
+            
+            return avg_relative_pose_token_loss, loss_value
 
-            total_loss = avg_relative_pose_token_loss + rel_pose_loss
+        # When all_camera_only=True, skip 3D point loss (no valid depth supervision)
+        # Only compute pose loss and relative_pose_token_loss
+        if all_camera_only:
+            details = {}
+            pose_loss = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
+            details["pose_loss"] = pose_loss
+            
+            # Compute relative_pose_token_loss
+            avg_relative_pose_token_loss, loss_value = compute_relative_pose_token_loss(gt_poses, preds)
+            details["relative_pose_token_loss"] = loss_value
+
+            # Return pose losses only (no 3D point loss)
+            total_loss = avg_relative_pose_token_loss
             
             return total_loss, details
 
-        # self view loss and details
+        # self view loss and details (only computed when not all_camera_only)
         if "Quantile" in self.criterion.__class__.__name__:
             raise NotImplementedError
         else:
@@ -1147,48 +1206,58 @@ class Regr3DPoseBatchList(Regr3DPose):
             # quantile masks have already been determined by self view losses, here pass in None as quantile
             raise NotImplementedError
         else:
-            gt_pts_cross_b = torch.unbind(
-                torch.stack(gt_pts_cross, dim=1)[~camera_only], dim=0
-            )
-            pred_pts_cross_b = torch.unbind(
-                torch.stack(pred_pts_cross, dim=1)[~camera_only], dim=0
-            )
-            masks_cross_b = torch.unbind(torch.stack(masks, dim=1)[~camera_only], dim=0)
-            ls_cross_b = []
-            for i in range(len(gt_pts_cross_b)):
-                if depth_only[~camera_only][i]:
-                    ls_cross_b.append(
-                        self.depth_only_criterion(
-                            pred_pts_cross_b[i][..., -1],
-                            gt_pts_cross_b[i][..., -1],
-                            masks_cross_b[i],
+            # Filter out camera_only views for cross-view loss computation
+            camera_only_mask = ~camera_only
+            if camera_only_mask.any():
+                gt_pts_cross_b = torch.unbind(
+                    torch.stack(gt_pts_cross, dim=1)[camera_only_mask], dim=0
+                )
+                pred_pts_cross_b = torch.unbind(
+                    torch.stack(pred_pts_cross, dim=1)[camera_only_mask], dim=0
+                )
+                masks_cross_b = torch.unbind(torch.stack(masks, dim=1)[camera_only_mask], dim=0)
+                ls_cross_b = []
+                for i in range(len(gt_pts_cross_b)):
+                    if depth_only[camera_only_mask][i]:
+                        ls_cross_b.append(
+                            self.depth_only_criterion(
+                                pred_pts_cross_b[i][..., -1],
+                                gt_pts_cross_b[i][..., -1],
+                                masks_cross_b[i],
+                            )
                         )
-                    )
-                elif single_view[~camera_only][i] and not is_metric[~camera_only][i]:
-                    ls_cross_b.append(
-                        self.single_view_criterion(
-                            pred_pts_cross_b[i], gt_pts_cross_b[i], masks_cross_b[i]
+                    elif single_view[camera_only_mask][i] and not is_metric[camera_only_mask][i]:
+                        ls_cross_b.append(
+                            self.single_view_criterion(
+                                pred_pts_cross_b[i], gt_pts_cross_b[i], masks_cross_b[i]
+                            )
                         )
-                    )
-                else:
-                    ls_cross_b.append(
-                        self.criterion(
-                            pred_pts_cross_b[i][masks_cross_b[i]],
-                            gt_pts_cross_b[i][masks_cross_b[i]],
+                    else:
+                        ls_cross_b.append(
+                            self.criterion(
+                                pred_pts_cross_b[i][masks_cross_b[i]],
+                                gt_pts_cross_b[i][masks_cross_b[i]],
+                            )
                         )
-                    )
-            ls_cross = self.reorg(ls_cross_b, masks_cross_b)
+                ls_cross = self.reorg(ls_cross_b, masks_cross_b)
+                # Create masks_cross from filtered masks
+                camera_only_mask = ~camera_only
+                masks_cross = [mask[camera_only_mask] for mask in masks]
+            else:
+                # All views are camera_only, no cross-view loss
+                ls_cross = []
+                masks_cross = []
 
         if self.sky_loss_value > 0:
             assert (
                 self.criterion.reduction == "none"
             ), "sky_loss_value should be 0 if no conf loss"
-            masks_cross = [mask[~camera_only] for mask in masks]
-            skys_cross = [sky[~camera_only] for sky in skys]
-            for i, l in enumerate(ls_cross):
-                ls_cross[i] = torch.where(
-                    skys_cross[i][masks_cross[i]], self.sky_loss_value, l
-                )
+            if len(ls_cross) > 0:
+                skys_cross = [sky[~camera_only] for sky in skys]
+                for i, l in enumerate(ls_cross):
+                    ls_cross[i] = torch.where(
+                        skys_cross[i][masks_cross[i]], self.sky_loss_value, l
+                    )
 
         for i in range(len(ls_cross)):
             details[self_name + f"_pts3d/{i+1}"] = float(
@@ -1202,8 +1271,41 @@ class Regr3DPoseBatchList(Regr3DPose):
         details["img_ids"] = (
             np.arange(len(ls_self)).tolist() + np.arange(len(ls_cross)).tolist()
         )
-        pose_masks = pose_masks * gts[i]["img_mask"]
-        details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
+        
+        # Fix pose_masks shape: expand from [B] to [B, N] to match pred_trans/gt_trans shape [B, N, 3]
+        # pose_masks should mask which batch samples and which views are valid
+        if isinstance(pose_masks, torch.Tensor):
+            B = pose_masks.shape[0] if pose_masks.ndim > 0 else 1
+            N = len(gt_poses)  # Number of views
+            if pose_masks.ndim == 1 and pose_masks.shape[0] == B:
+                # Expand [B] to [B, N] - each batch sample applies to all views
+                pose_masks = pose_masks.unsqueeze(1).expand(B, N)
+            elif pose_masks.ndim == 0:
+                # Scalar mask - expand to [B, N]
+                pose_masks = pose_masks.expand(B, N)
+        
+        # Apply img_mask if available (should be [B] or [B, N])
+        if "img_mask" in gts[0]:
+            img_mask = gts[0]["img_mask"]
+            if isinstance(img_mask, torch.Tensor):
+                if img_mask.ndim == 1:
+                    # [B] -> expand to [B, N]
+                    if img_mask.shape[0] == B:
+                        img_mask = img_mask.unsqueeze(1).expand(B, N)
+                    elif img_mask.shape[0] == 1:
+                        # Broadcast single value
+                        img_mask = img_mask.expand(B, N)
+                elif img_mask.ndim == 0:
+                    # Scalar -> expand to [B, N]
+                    img_mask = img_mask.expand(B, N)
+                pose_masks = pose_masks & img_mask
+        
+        # details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
+        
+        # Compute relative_pose_token_loss if available (independent of camera_only mode)
+        # This allows training relative pose estimation alongside 3D point regression
+        avg_relative_pose_token_loss, relative_pose_loss_value = compute_relative_pose_token_loss(gt_poses, preds)
+        details["relative_pose_token_loss"] = relative_pose_loss_value
 
         return Sum(*list(zip(ls, masks))), (details | monitoring)
 
@@ -1296,6 +1398,9 @@ class ConfLoss(MultiLoss):
             final_loss = (
                 final_loss + details["pose_loss"] #.clip(max=0.3) * 5.0
             )  # , details
+        if "relative_pose_token_loss" in details:
+            # Add relative_pose_token_loss to final loss (computed when pose_head=True)
+            final_loss = final_loss + details["relative_pose_token_loss"]
         if "scale_loss" in details:
             final_loss = final_loss + details["scale_loss"]
         return final_loss, details

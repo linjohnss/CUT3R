@@ -112,6 +112,18 @@ def parse_args():
         default="",
         help="Path to the directory containing ground truth camera poses (.npz files). If not provided, will use seq_path/../cam",
     )
+    parser.add_argument(
+        "--use_gating",
+        action="store_true",
+        default=True,
+        help="Enable gating mechanism (reset_gate and update_gate). Default: True",
+    )
+    parser.add_argument(
+        "--no_gating",
+        dest="use_gating",
+        action="store_false",
+        help="Disable gating mechanism (reset_gate and update_gate)",
+    )
     return parser.parse_args()
 
 
@@ -328,20 +340,39 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
 
     # Recover camera poses.
-    # camera_pose format: (B, 12) = (B, 3 + 9) - translation + 9D rotation matrix
-    from src.dust3r.utils.camera import rotation_9d_to_matrix
+    # camera_pose format can be:
+    #   - (B, 4, 4): 4x4 SE(3) matrix
+    #   - (B, 12): 3 translation + 9D rotation matrix
+    #   - (B, 7): 3 translation + 4 quaternion (absT_quaR format)
+    from src.dust3r.utils.camera import rotation_9d_to_matrix, pose_encoding_to_camera
     
     pr_poses = []
     for pred in outputs["pred"]:
-        camera_pose = pred["camera_pose"].clone().cpu()  # (B, 12)
-        trans = camera_pose[:, :3]  # (B, 3)
-        rot_9d = camera_pose[:, 3:12]  # (B, 9)
-        rot_mat = rotation_9d_to_matrix(rot_9d)  # (B, 3, 3)
+        camera_pose = pred["camera_pose"].clone().cpu()
         
-        # Construct 4x4 pose matrix
-        pose_4x4 = torch.eye(4).unsqueeze(0).repeat(camera_pose.shape[0], 1, 1)
-        pose_4x4[:, :3, :3] = rot_mat
-        pose_4x4[:, :3, 3] = trans
+        # Handle different formats
+        if camera_pose.dim() == 3 and camera_pose.shape[-1] == 4 and camera_pose.shape[-2] == 4:
+            # Already 4x4 matrix format
+            pose_4x4 = camera_pose
+        elif camera_pose.shape[-1] == 12:
+            # (B, 12) format: 3 translation + 9D rotation
+            trans = camera_pose[:, :3]  # (B, 3)
+            rot_9d = camera_pose[:, 3:12]  # (B, 9)
+            rot_mat = rotation_9d_to_matrix(rot_9d)  # (B, 3, 3)
+            
+            # Construct 4x4 pose matrix
+            pose_4x4 = torch.eye(4).unsqueeze(0).repeat(camera_pose.shape[0], 1, 1)
+            pose_4x4[:, :3, :3] = rot_mat
+            pose_4x4[:, :3, 3] = trans
+        elif camera_pose.shape[-1] == 7:
+            # (B, 7) format: 3 translation + 4 quaternion (absT_quaR)
+            pose_4x4 = pose_encoding_to_camera(camera_pose, pose_encoding_type="absT_quaR")
+        else:
+            raise ValueError(
+                f"Unsupported camera_pose shape {camera_pose.shape}; "
+                f"expected (B,4,4), (B,12), or (B,7)"
+            )
+        
         pr_poses.append(pose_4x4)
     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
     t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
@@ -517,10 +548,16 @@ def load_lora_weights(model, lora_path, device):
     print("LoRA weights loaded successfully!")
 
 
-def load_imu_weights(model, imu_path, device):
+def load_imu_weights(model, imu_path, device, use_gating=True):
     """
     Load IMU weights and convert model to CUT3RIMU if needed.
     Supports both old format (direct state dict) and new format (checkpoint with 'imu_weights' key).
+    
+    Args:
+        model: Base model to enhance with IMU
+        imu_path: Path to IMU weights file
+        device: Device to load weights on
+        use_gating: Whether to enable gating mechanism (default: True)
     """
     if not os.path.exists(imu_path):
         print(f"Warning: IMU path {imu_path} does not exist")
@@ -545,7 +582,7 @@ def load_imu_weights(model, imu_path, device):
             full_model_state = checkpoint['model']
             # Extract IMU-related keys from full model
             imu_state_dict = {}
-            for key in ['imu_encoder', 'relative_pose_decoder', 'pose_transformer', 'relative_pose_token']:
+            for key in ['imu_encoder', 'relative_pose_decoder', 'pose_transformer', 'relative_pose_token', 'reset_gate', 'update_gate']:
                 # Try both with and without 'module.' prefix (for DDP)
                 for prefix in ['', 'module.']:
                     full_key = f"{prefix}{key}"
@@ -606,6 +643,18 @@ def load_imu_weights(model, imu_path, device):
                 model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
                 print("✅ Loaded relative pose decoder weights")
         
+        # Load reset gate weights (only if gating is enabled)
+        if use_gating and 'reset_gate' in imu_state_dict and hasattr(model, 'reset_gate'):
+            if isinstance(imu_state_dict['reset_gate'], dict):
+                model.reset_gate.load_state_dict(imu_state_dict['reset_gate'])
+                print("✅ Loaded reset gate weights")
+        
+        # Load update gate weights (only if gating is enabled)
+        if use_gating and 'update_gate' in imu_state_dict and hasattr(model, 'update_gate'):
+            if isinstance(imu_state_dict['update_gate'], dict):
+                model.update_gate.load_state_dict(imu_state_dict['update_gate'])
+                print("✅ Loaded update gate weights")
+        
         return model
     else:
         # Convert to CUT3RIMU
@@ -616,7 +665,8 @@ def load_imu_weights(model, imu_path, device):
         imu_config = {
             'input_dim': 6,
             'seq_len': 10,
-            'dropout': 0.1
+            'dropout': 0.0,
+            'use_gating': use_gating
         }
         
         # Create CUT3RIMU model
@@ -644,6 +694,18 @@ def load_imu_weights(model, imu_path, device):
             if isinstance(imu_state_dict['relative_pose_decoder'], dict):
                 imu_model.relative_pose_decoder.load_state_dict(imu_state_dict['relative_pose_decoder'])
                 print("✅ Loaded relative pose decoder weights")
+        
+        # Load reset gate weights (only if gating is enabled)
+        if use_gating and 'reset_gate' in imu_state_dict and hasattr(imu_model, 'reset_gate'):
+            if isinstance(imu_state_dict['reset_gate'], dict):
+                imu_model.reset_gate.load_state_dict(imu_state_dict['reset_gate'])
+                print("✅ Loaded reset gate weights")
+        
+        # Load update gate weights (only if gating is enabled)
+        if use_gating and 'update_gate' in imu_state_dict and hasattr(imu_model, 'update_gate'):
+            if isinstance(imu_state_dict['update_gate'], dict):
+                imu_model.update_gate.load_state_dict(imu_state_dict['update_gate'])
+                print("✅ Loaded update gate weights")
         
         print("✅ Successfully converted to CUT3RIMU and loaded all IMU weights")
         return imu_model
@@ -677,7 +739,7 @@ def run_inference(args):
         return
 
     # Limit images to 200 maximum
-    MAX_IMAGES = 200
+    MAX_IMAGES = 1000
     if len(img_paths) > MAX_IMAGES:
         print(f"Found {len(img_paths)} images, limiting to {MAX_IMAGES} images.")
         img_paths = img_paths[:MAX_IMAGES]
@@ -798,13 +860,15 @@ def run_inference(args):
     
     # Load IMU weights if provided
     if args.imu_path and os.path.exists(args.imu_path):
-        model = load_imu_weights(model, args.imu_path, device)
+        model = load_imu_weights(model, args.imu_path, device, use_gating=args.use_gating)
         # Ensure model is on the correct device
         model = model.to(device)
         # Verify IMU model is properly loaded
         if hasattr(model, 'imu_encoder'):
             print("✅ IMU model successfully loaded and ready for inference")
             print(f"   - IMU encoder: {type(model.imu_encoder).__name__}")
+            if hasattr(model, 'use_gating'):
+                print(f"   - Gating mechanism: {'Enabled' if model.use_gating else 'Disabled'}")
             if hasattr(model, 'imu_pose_retriever'):
                 print(f"   - IMU pose retriever: {type(model.imu_pose_retriever).__name__}")
             if hasattr(model, 'relative_pose_decoder'):

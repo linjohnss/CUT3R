@@ -30,7 +30,7 @@ class KITTI_Multi(BaseMultiViewDataset):
         self.video = True  # KITTI is a video dataset
         self.is_metric = True  # Changed to False to match RE10K
         self.max_interval = 128  # Changed to match RE10K
-        self.precompute_model = precompute_model  # Model for state precomputation
+        self.precompute_model = precompute_model  # Full CUT3RIMU model for state precomputation (with relative_pose_token)
         self.precompute_device = precompute_device  # Device for precomputation
         self.precomputed_states = {}  # Store precomputed states: {scene_id: {frame_idx: state}}
         self.demo_compatible = demo_compatible  # Use demo-compatible crop (simple center crop)
@@ -326,6 +326,46 @@ class KITTI_Multi(BaseMultiViewDataset):
             # Clear GPU cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    
+    def recompute_states(self, updated_model):
+        """
+        Recompute precomputed states with an updated model.
+        This allows periodic recomputation during training to align with the evolving model.
+        
+        Args:
+            updated_model: Updated CUT3RIMU model (should include relative_pose_token)
+        """
+        import torch.distributed as dist
+        
+        # Only recompute in main process
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+        if not is_main_process:
+            return
+        
+        print("\n" + "=" * 80)
+        print("🔄 RECOMPUTING PRECOMPUTED STATES WITH UPDATED MODEL")
+        print(f"Updated model type: {type(updated_model)}")
+        print("=" * 80)
+        
+        # Update model reference
+        old_model = self.precompute_model
+        self.precompute_model = updated_model
+        
+        # Recompute all states
+        try:
+            self._precompute_all_states()
+            print("=" * 80)
+            print(f"✅ STATE RECOMPUTATION COMPLETED FOR {len(self.precomputed_states)} SCENES")
+            for scene_id, states in self.precomputed_states.items():
+                print(f"  Scene {scene_id}: {len(states)} precomputed states")
+            print("=" * 80)
+        except Exception as e:
+            print(f"❌ ERROR during state recomputation: {e}")
+            import traceback
+            traceback.print_exc()
+            # Restore old model on error
+            self.precompute_model = old_model
+            raise
     
     def _crop_resize_if_necessary(self, image, depthmap, intrinsics, resolution, rng=None, info=None):
         """

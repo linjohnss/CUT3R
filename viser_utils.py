@@ -779,7 +779,7 @@ class PointCloudViewer:
                 position=t,
                 scale=0.1,
                 color=rainbow_color,
-                image=self.orig_img_list[step][::4, ::4]
+                image=None  # Don't show image on camera frustum
             )
         )
         
