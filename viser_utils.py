@@ -337,7 +337,8 @@ class PointCloudViewer:
         port=8080,
         show_camera=True,
         vis_threshold=1,
-        size=512
+        size=512,
+        downsample_factor=1,
     ):
         self.model = model
         self.size=size
@@ -347,6 +348,7 @@ class PointCloudViewer:
         self.device = device
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
+        self.downsample_factor = downsample_factor
         self.tt = lambda x: torch.from_numpy(x).float().to(device)
         self.pcs, self.all_steps = self.read_data(
             pc_list, color_list, conf_list, edge_color_list
@@ -549,7 +551,7 @@ class PointCloudViewer:
                 depthmap = output["pred"]["pts3d_in_self_view"].cpu().numpy()[0][..., -1]
                 conf = output["pred"]["conf"].cpu().numpy()
                 disp = 1.0 / depthmap
-                pts3ds, colors = self.parse_pc_data(pts3ds, colors, set_border_color=True)
+                pts3ds, colors = self.parse_pc_data(pts3ds, colors, set_border_color=True, downsample_factor=self.downsample_factor)
                 mask = (conf > 1.0).reshape(-1)
                 self.num_frames += 1
                 self.pc_handles.append(
@@ -626,7 +628,10 @@ class PointCloudViewer:
         conf=None,
         edge_color=[0.251, 0.702, 0.902],
         set_border_color=False,
+        downsample_factor=None,
     ):
+        if downsample_factor is None:
+            downsample_factor = self.downsample_factor
 
         pred_pts = pc.reshape(-1, 3)  # [N, 3]
 
@@ -642,6 +647,13 @@ class PointCloudViewer:
             conf = conf[0].reshape(-1)
             pred_pts = pred_pts[conf > self.vis_threshold]
             color = color[conf > self.vis_threshold]
+        
+        # Apply downsampling
+        if downsample_factor > 1 and len(pred_pts) > 0:
+            indices = np.arange(0, len(pred_pts), downsample_factor)
+            pred_pts = pred_pts[indices]
+            color = color[indices]
+        
         return pred_pts, color
 
     def add_pc(self, step):
@@ -651,7 +663,7 @@ class PointCloudViewer:
         edge_color = self.pcs[step].get("edge_color", None)
 
         pred_pts, color = self.parse_pc_data(
-            pc, color, conf, edge_color, set_border_color=True
+            pc, color, conf, edge_color, set_border_color=True, downsample_factor=self.downsample_factor
         )
 
         self.vis_pts_list.append(pred_pts)

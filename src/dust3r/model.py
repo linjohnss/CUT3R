@@ -19,6 +19,7 @@ import time
 from dust3r.utils.misc import (
     fill_default_args,
     freeze_all_params,
+    fix_all_params,
     is_symmetrized,
     interleave,
     transpose_to_landscape,
@@ -72,7 +73,7 @@ def strip_module(state_dict):
 def load_model(model_path, device, verbose=True):
     if verbose:
         print("... loading model from", model_path)
-    ckpt = torch.load(model_path, map_location="cpu")
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     args = ckpt["args"].model.replace(
         "ManyAR_PatchEmbed", "PatchEmbedDust3R"
     )  # ManyAR only for aspect ratio not consistent
@@ -114,6 +115,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         rgb_head=False,
         pose_conf_head=False,
         pose_head=False,
+        num_prompt_tokens=8,
         **croco_kwargs,
     ):
         super().__init__()
@@ -134,6 +136,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.rgb_head = rgb_head
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
+        self.num_prompt_tokens = num_prompt_tokens
         self.croco_kwargs = croco_kwargs
 
 
@@ -278,6 +281,10 @@ class ARCroco3DStereo(CroCoNet):
         self.masked_ray_map_token = nn.Parameter(
             torch.randn(1, self.enc_embed_dim) * 0.02, requires_grad=True
         )
+        self.relative_pose_token = nn.Parameter(
+            torch.randn(1, config.num_prompt_tokens, self.dec_embed_dim) * 0.02, requires_grad=True
+        )
+        self.num_prompt_tokens = config.num_prompt_tokens
         self._set_state_decoder(
             self.enc_embed_dim,
             self.dec_embed_dim,
@@ -468,8 +475,36 @@ class ARCroco3DStereo(CroCoNet):
                 self.pose_retriever,
                 self.pose_token,
             ],
+            "encoder_and_decoder_and_head": [
+                self.patch_embed,
+                self.patch_embed_ray_map,
+                self.masked_img_token,
+                self.masked_ray_map_token,
+                self.enc_blocks,
+                self.enc_blocks_ray_map,
+                self.enc_norm,
+                self.enc_norm_ray_map,
+                self.dec_blocks,
+                self.dec_blocks_state,
+                self.pose_retriever,
+                self.pose_token,
+                self.register_tokens,
+                self.decoder_embed_state,
+                self.decoder_embed,
+                self.dec_norm,
+                self.dec_norm_state,
+                self.downstream_head.dpt_self,
+                self.downstream_head.final_transform,
+                self.downstream_head.dpt_cross,
+                self.downstream_head.dpt_rgb,
+                self.downstream_head.pose_head,
+            ],
         }
-        freeze_all_params(to_be_frozen[freeze])
+        if freeze == "encoder_and_decoder_and_head":
+            fix_all_params(to_be_frozen["encoder_and_decoder_and_head"]) # will not be updated
+            freeze_all_params(to_be_frozen["encoder"]) # requires_grad = False
+        else:
+            freeze_all_params(to_be_frozen[freeze])
 
     def _set_prediction_head(self, *args, **kwargs):
         """No prediction head"""
@@ -657,14 +692,18 @@ class ARCroco3DStereo(CroCoNet):
             full_pos.chunk(len(views), dim=0),
         )
 
-    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose):
+    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, f_rel_pose, pos_rel_pose):
         final_output = [(f_state, f_img)]  # before projection
         assert f_state.shape[-1] == self.dec_embed_dim
         f_img = self.decoder_embed(f_img)
         if self.pose_head_flag:
             assert f_pose is not None and pos_pose is not None
-            f_img = torch.cat([f_pose, f_img], dim=1)
-            pos_img = torch.cat([pos_pose, pos_img], dim=1)
+            if f_rel_pose is not None and pos_rel_pose is not None:
+                f_img = torch.cat([f_pose, f_img, f_rel_pose], dim=1)
+                pos_img = torch.cat([pos_pose, pos_img, pos_rel_pose], dim=1)
+            else:
+                f_img = torch.cat([f_pose, f_img], dim=1)
+                pos_img = torch.cat([pos_pose, pos_img], dim=1)
         final_output.append((f_state, f_img))
         for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
             if (
@@ -718,13 +757,15 @@ class ARCroco3DStereo(CroCoNet):
         current_pos,
         pose_feat,
         pose_pos,
+        rel_pose_feat,
+        rel_pose_pos,
         init_state_feat,
         img_mask=None,
         reset_mask=None,
         update=None,
     ):
         new_state_feat, dec = self._decoder(
-            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos
+            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos, rel_pose_feat, rel_pose_pos
         )
         new_state_feat = new_state_feat[-1]
         return new_state_feat, dec
@@ -769,9 +810,18 @@ class ARCroco3DStereo(CroCoNet):
             pose_pos_i = -torch.ones(
                 feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
             )
+            rel_pose_feat_i = self.relative_pose_token.expand(feat_i.shape[0], -1, -1)
+            n_prompt_tokens = rel_pose_feat_i.shape[1]
+            rel_pose_pos_i = -torch.ones(
+                feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
+            )
         else:
             pose_feat_i = None
             pose_pos_i = None
+            rel_pose_feat_i = None
+            rel_pose_pos_i = None
+            n_prompt_tokens = 0
+        
         new_state_feat, dec = self._recurrent_rollout(
             state_feat,
             state_pos,
@@ -779,6 +829,8 @@ class ARCroco3DStereo(CroCoNet):
             pos_i,
             pose_feat_i,
             pose_pos_i,
+            rel_pose_feat_i,
+            rel_pose_pos_i,
             init_state_feat,
             img_mask=views[i]["img_mask"],
             reset_mask=views[i]["reset"],
@@ -788,13 +840,33 @@ class ARCroco3DStereo(CroCoNet):
         new_mem = self.pose_retriever.update_mem(
             mem, global_img_feat_i, out_pose_feat_i
         )
-        head_input = [
-            dec[0].float(),
-            dec[self.dec_depth * 2 // 4][:, 1:].float(),
-            dec[self.dec_depth * 3 // 4][:, 1:].float(),
-            dec[self.dec_depth].float(),
-        ]
-        res = self._downstream_head(head_input, shape_i, pos=pos_i)
+
+        if n_prompt_tokens > 0:
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+            ]
+            rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+        else:
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                dec[self.dec_depth].float(),
+            ]
+            rel_pose_token = None
+        res = self._downstream_head(head_input, shape_i, pos=pos_i, rel_pose_token=rel_pose_token)
+
+        if res.get("relative_pose") is not None and i > 0:
+            T_rel = res.get("relative_pose")
+            T_rel_inv = torch.inverse(T_rel.float()).to(T_rel.dtype)
+            current_T_c2w = self.prev_T_c2w @ T_rel_inv
+            self.prev_T_c2w = current_T_c2w
+        elif i == 0:
+            self.prev_T_c2w = torch.eye(4, device=res["camera_pose"].device, dtype=res["camera_pose"].dtype).unsqueeze(0).expand(res["camera_pose"].shape[0], -1, -1)
+        
         img_mask = views[i]["img_mask"]
         update = views[i].get("update", None)
         if update is not None:
@@ -825,6 +897,7 @@ class ARCroco3DStereo(CroCoNet):
         for i in range(len(views)):
             feat_i = feat[i]
             pos_i = pos[i]
+
             if self.pose_head_flag:
                 global_img_feat_i = self._get_img_level_feat(feat_i)
                 if i == 0:
@@ -834,9 +907,18 @@ class ARCroco3DStereo(CroCoNet):
                 pose_pos_i = -torch.ones(
                     feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
                 )
+                rel_pose_feat_i = self.relative_pose_token.expand(feat_i.shape[0], -1, -1)
+                n_prompt_tokens = rel_pose_feat_i.shape[1]
+                rel_pose_pos_i = -torch.ones(
+                    feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
+                )
             else:
                 pose_feat_i = None
                 pose_pos_i = None
+                rel_pose_feat_i = None
+                rel_pose_pos_i = None
+                n_prompt_tokens = 0
+            
             new_state_feat, dec = self._recurrent_rollout(
                 state_feat,
                 state_pos,
@@ -844,6 +926,8 @@ class ARCroco3DStereo(CroCoNet):
                 pos_i,
                 pose_feat_i,
                 pose_pos_i,
+                rel_pose_feat_i,
+                rel_pose_pos_i,
                 init_state_feat,
                 img_mask=views[i]["img_mask"],
                 reset_mask=views[i]["reset"],
@@ -854,13 +938,32 @@ class ARCroco3DStereo(CroCoNet):
                 mem, global_img_feat_i, out_pose_feat_i
             )
             assert len(dec) == self.dec_depth + 1
-            head_input = [
-                dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:].float(),
-                dec[self.dec_depth].float(),
-            ]
-            res = self._downstream_head(head_input, shape[i], pos=pos_i)
+            if n_prompt_tokens > 0:
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                ]
+                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+            else:
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                    dec[self.dec_depth].float(),
+                ]
+                rel_pose_token = None
+            res = self._downstream_head(head_input, shape[i], pos=pos_i, rel_pose_token=rel_pose_token)
+
+            if res.get("relative_pose") is not None and i > 0:
+                T_rel = res.get("relative_pose")
+                T_rel_inv = torch.inverse(T_rel.float()).to(T_rel.dtype)
+                current_T_c2w = self.prev_T_c2w @ T_rel_inv
+                self.prev_T_c2w = current_T_c2w
+            elif i == 0:
+                self.prev_T_c2w = torch.eye(4, device=res["camera_pose"].device, dtype=res["camera_pose"].dtype).unsqueeze(0).expand(res["camera_pose"].shape[0], -1, -1)
+            
             ress.append(res)
             img_mask = views[i]["img_mask"]
             update = views[i].get("update", None)
@@ -930,9 +1033,18 @@ class ARCroco3DStereo(CroCoNet):
             pose_pos_i = -torch.ones(
                 feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
             )
+            rel_pose_feat_i = self.relative_pose_token.expand(feat_i.shape[0], -1, -1)
+            n_prompt_tokens = rel_pose_feat_i.shape[1]
+            rel_pose_pos_i = -torch.ones(
+                feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
+            )
         else:
             pose_feat_i = None
             pose_pos_i = None
+            rel_pose_feat_i = None
+            rel_pose_pos_i = None
+            n_prompt_tokens = 0
+        
         new_state_feat, dec = self._recurrent_rollout(
             state_feat,
             state_pos,
@@ -940,6 +1052,8 @@ class ARCroco3DStereo(CroCoNet):
             pos_i,
             pose_feat_i,
             pose_pos_i,
+            rel_pose_feat_i,
+            rel_pose_pos_i,
             init_state_feat,
             img_mask=view["img_mask"],
             reset_mask=view["reset"],
@@ -951,63 +1065,89 @@ class ARCroco3DStereo(CroCoNet):
             mem, global_img_feat_i, out_pose_feat_i
         )
         assert len(dec) == self.dec_depth + 1
-        head_input = [
-            dec[0].float(),
-            dec[self.dec_depth * 2 // 4][:, 1:].float(),
-            dec[self.dec_depth * 3 // 4][:, 1:].float(),
-            dec[self.dec_depth].float(),
-        ]
-        res = self._downstream_head(head_input, shape, pos=pos_i)
+        if n_prompt_tokens > 0:
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+            ]
+            rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+        else:
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                dec[self.dec_depth].float(),
+            ]
+            rel_pose_token = None
+        res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token)
         return res, view
 
     def forward_recurrent(self, views, device, ret_state=False):
         ress = []
         all_state_args = []
-        for i, view in enumerate(views):
-            device = view["img"].device
+        processed_views = []  # Store processed views with minimal data
+        # Initialize state variables
+        state_feat = None
+        state_pos = None
+        init_state_feat = None
+        mem = None
+        init_mem = None
+        # Process views one at a time to save GPU memory
+        for i, cpu_view in enumerate(views):
+            print(f"Processing view {i + 1}/{len(views)} - GPU memory management active")
+            
+            # Move current view to GPU
+            view = {}
+            ignore_keys = set(["depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"])
+            
+            for name, value in cpu_view.items():
+                if name in ignore_keys:
+                    view[name] = value
+                elif isinstance(value, tuple) or isinstance(value, list):
+                    view[name] = [x.to(device, non_blocking=True) for x in value]
+                else:
+                    view[name] = value.to(device, non_blocking=True)
+            
+            # Set device from the current view
+            current_device = view["img"].device
             batch_size = view["img"].shape[0]
-            img_mask = view["img_mask"].reshape(
-                -1, batch_size
-            )  # Shape: (1, batch_size)
-            ray_mask = view["ray_mask"].reshape(
-                -1, batch_size
-            )  # Shape: (1, batch_size)
-            imgs = view["img"].unsqueeze(0)  # Shape: (1, batch_size, C, H, W)
-            ray_maps = view["ray_map"].unsqueeze(
-                0
-            )  # Shape: (num_views, batch_size, H, W, C)
+            
+            img_mask = view["img_mask"].reshape(-1, batch_size)
+            ray_mask = view["ray_mask"].reshape(-1, batch_size)
+            imgs = view["img"].unsqueeze(0)
+            ray_maps = view["ray_map"].unsqueeze(0)
+            
             shapes = (
                 view["true_shape"].unsqueeze(0)
                 if "true_shape" in view
-                else torch.tensor(view["img"].shape[-2:], device=device)
+                else torch.tensor(view["img"].shape[-2:], device=current_device)
                 .unsqueeze(0)
                 .repeat(batch_size, 1)
                 .unsqueeze(0)
-            )  # Shape: (num_views, batch_size, 2)
-            imgs = imgs.view(
-                -1, *imgs.shape[2:]
-            )  # Shape: (num_views * batch_size, C, H, W)
-            ray_maps = ray_maps.view(
-                -1, *ray_maps.shape[2:]
-            )  # Shape: (num_views * batch_size, H, W, C)
-            shapes = shapes.view(-1, 2).to(
-                imgs.device
-            )  # Shape: (num_views * batch_size, 2)
-            img_masks_flat = img_mask.view(-1)  # Shape: (num_views * batch_size)
+            )
+            
+            imgs = imgs.view(-1, *imgs.shape[2:])
+            ray_maps = ray_maps.view(-1, *ray_maps.shape[2:])
+            shapes = shapes.view(-1, 2).to(imgs.device)
+            
+            img_masks_flat = img_mask.view(-1)
             ray_masks_flat = ray_mask.view(-1)
             selected_imgs = imgs[img_masks_flat]
             selected_shapes = shapes[img_masks_flat]
+            
             if selected_imgs.size(0) > 0:
                 img_out, img_pos, _ = self._encode_image(selected_imgs, selected_shapes)
             else:
                 img_out, img_pos = None, None
-            ray_maps = ray_maps.permute(0, 3, 1, 2)  # Change shape to (N, C, H, W)
+                
+            ray_maps = ray_maps.permute(0, 3, 1, 2)
             selected_ray_maps = ray_maps[ray_masks_flat]
             selected_shapes_ray = shapes[ray_masks_flat]
+            
             if selected_ray_maps.size(0) > 0:
-                ray_out, ray_pos, _ = self._encode_ray_map(
-                    selected_ray_maps, selected_shapes_ray
-                )
+                ray_out, ray_pos, _ = self._encode_ray_map(selected_ray_maps, selected_shapes_ray)
             else:
                 ray_out, ray_pos = None, None
 
@@ -1029,8 +1169,9 @@ class ARCroco3DStereo(CroCoNet):
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                # Only store initial state
                 all_state_args.append(
-                    (state_feat, state_pos, init_state_feat, mem, init_mem)
+                    (state_feat.cpu(), state_pos.cpu(), init_state_feat.cpu(), mem.cpu(), init_mem.cpu())
                 )
 
             if self.pose_head_flag:
@@ -1042,9 +1183,18 @@ class ARCroco3DStereo(CroCoNet):
                 pose_pos_i = -torch.ones(
                     feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
                 )
+                rel_pose_feat_i = self.relative_pose_token.expand(feat_i.shape[0], -1, -1)
+                n_prompt_tokens = rel_pose_feat_i.shape[1]
+                rel_pose_pos_i = -torch.ones(
+                    feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
+                )
             else:
                 pose_feat_i = None
                 pose_pos_i = None
+                rel_pose_feat_i = None
+                rel_pose_pos_i = None
+                n_prompt_tokens = 0
+                
             new_state_feat, dec = self._recurrent_rollout(
                 state_feat,
                 state_pos,
@@ -1052,52 +1202,103 @@ class ARCroco3DStereo(CroCoNet):
                 pos_i,
                 pose_feat_i,
                 pose_pos_i,
+                rel_pose_feat_i,
+                rel_pose_pos_i,
                 init_state_feat,
                 img_mask=view["img_mask"],
                 reset_mask=view["reset"],
                 update=view.get("update", None),
             )
+            
             out_pose_feat_i = dec[-1][:, 0:1]
             new_mem = self.pose_retriever.update_mem(
                 mem, global_img_feat_i, out_pose_feat_i
             )
+            
             assert len(dec) == self.dec_depth + 1
-            head_input = [
-                dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:].float(),
-                dec[self.dec_depth].float(),
-            ]
-            res = self._downstream_head(head_input, shape, pos=pos_i)
-            ress.append(res)
+            if n_prompt_tokens > 0:
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                ]
+                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+            else:
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                    dec[self.dec_depth].float(),
+                ]
+                rel_pose_token = None
+            
+            res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token)
+            
+            # Move result to CPU immediately to save GPU memory
+            res_cpu = {}
+            for key, value in res.items():
+                if isinstance(value, torch.Tensor):
+                    res_cpu[key] = value.cpu()
+                else:
+                    res_cpu[key] = value
+            ress.append(res_cpu)
+            
+            # Create minimal processed view (keep only essential data on CPU)
+            processed_view = {
+                "img": view["img"].cpu(),
+                "idx": view.get("idx", i),
+                "instance": view.get("instance", str(i)),
+            }
+            processed_views.append(processed_view)
+            
             img_mask = view["img_mask"]
             update = view.get("update", None)
             if update is not None:
-                update_mask = (
-                    img_mask & update
-                )  # if don't update, then whatever img_mask
+                update_mask = img_mask & update
             else:
                 update_mask = img_mask
+                
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
-            )  # update global state
-            mem = new_mem * update_mask + mem * (
-                1 - update_mask
-            )  # then update local state
+            state_feat = new_state_feat * update_mask + state_feat * (1 - update_mask)
+            mem = new_mem * update_mask + mem * (1 - update_mask)
+            
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
-                )
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
-            all_state_args.append(
-                (state_feat, state_pos, init_state_feat, mem, init_mem)
-            )
+            
+            # Only append final state if needed
+            if ret_state and i == len(views) - 1:
+                all_state_args.append(
+                    (state_feat.cpu(), state_pos.cpu(), init_state_feat.cpu(), mem.cpu(), init_mem.cpu())
+                )
+            
+            # Explicit cleanup
+            del view, imgs, ray_maps, img_out, ray_out, feat_i, pos_i, res
+            del new_state_feat, dec, head_input
+            if 'global_img_feat_i' in locals():
+                del global_img_feat_i
+            if 'pose_feat_i' in locals():
+                del pose_feat_i
+            if 'out_pose_feat_i' in locals():
+                del out_pose_feat_i
+            if 'new_mem' in locals():
+                del new_mem
+                
+            # Force GPU memory cleanup
+            torch.cuda.empty_cache()
+            
+            # Print memory usage every 50 frames
+            if (i + 1) % 50 == 0:
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated(device) / 1024**3
+                    print(f"  After {i+1} frames: {allocated:.2f}GB GPU memory allocated")
+            
         if ret_state:
-            return ress, views, all_state_args
-        return ress, views
+            return ress, processed_views, all_state_args
+        return ress, processed_views
 
 
 if __name__ == "__main__":

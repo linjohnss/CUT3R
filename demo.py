@@ -10,10 +10,19 @@ image size, device, etc.
 Usage:
     python demo.py [--model_path MODEL_PATH] [--seq_path SEQ_PATH] [--size IMG_SIZE]
                             [--device DEVICE] [--vis_threshold VIS_THRESHOLD] [--output_dir OUT_DIR]
+                            [--downsample_factor FACTOR] [--use_relative_pose] [--no_relative_pose]
 
 Example:
     python demo.py --model_path src/cut3r_512_dpt_4_64.pth \
         --seq_path examples/001 --device cuda --size 512
+    
+    # Use relative pose accumulation (if available in model output)
+    python demo.py --model_path src/checkpoints/prompt3r/checkpoint-best.pth \
+        --seq_path examples/vkitti_scene01 --device cuda --use_relative_pose
+    
+    # Force to use direct camera_pose (ignore relative_pose)
+    python demo.py --model_path src/checkpoints/prompt3r/checkpoint-best.pth \
+        --seq_path examples/vkitti_scene01 --device cuda --no_relative_pose
 """
 
 import os
@@ -74,6 +83,22 @@ def parse_args():
         type=str,
         default="./demo_tmp",
         help="value for tempfile.tempdir",
+    )
+    parser.add_argument(
+        "--downsample_factor",
+        type=int,
+        default=1,
+        help="Downsample factor for the point cloud viewer",
+    )
+    parser.add_argument(
+        "--use_relative_pose",
+        action="store_true",
+        help="Use relative pose accumulation instead of direct camera_pose. If not set, will auto-detect based on model output.",
+    )
+    parser.add_argument(
+        "--no_relative_pose",
+        action="store_true",
+        help="Force to use direct camera_pose instead of relative pose accumulation.",
     )
 
     return parser.parse_args()
@@ -186,7 +211,7 @@ def prepare_input(
     return views
 
 
-def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
@@ -194,6 +219,10 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
         outputs (dict): Inference outputs.
         revisit (int): Number of revisits per view.
         use_pose (bool): Whether to transform points using camera pose.
+        use_relative_pose (bool, optional): Whether to use relative pose accumulation.
+            If None, will auto-detect based on model output.
+            If True, will use relative pose if available.
+            If False, will force to use direct camera_pose.
 
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
@@ -213,11 +242,51 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     conf_other = [output["conf"].cpu() for output in outputs["pred"]]
     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
 
-    # Recover camera poses.
-    pr_poses = [
-        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-        for pred in outputs["pred"]
-    ]
+    # Determine whether to use relative_pose
+    if use_relative_pose is None:
+        # Auto-detect: check if relative_pose is available in predictions
+        use_relative_pose = any("relative_pose" in pred and pred.get("relative_pose") is not None for pred in outputs["pred"])
+    elif use_relative_pose:
+        # User explicitly requested relative pose, check if available
+        has_relative_pose = any("relative_pose" in pred and pred.get("relative_pose") is not None for pred in outputs["pred"])
+        if not has_relative_pose:
+            print("Warning: --use_relative_pose specified but relative_pose not found in model output. Falling back to camera_pose.")
+            use_relative_pose = False
+    
+    if use_relative_pose:
+        # Accumulate camera poses from relative_pose (4x4 matrix multiplication)
+        pr_poses = []
+        prev_T_c2w = None
+        
+        for i, pred in enumerate(outputs["pred"]):
+            if i == 0:
+                # First frame: use identity matrix (world frame origin)
+                B = pred["pts3d_in_self_view"].shape[0]
+                prev_T_c2w = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
+            else:
+                # Subsequent frames: accumulate from relative_pose
+                if "relative_pose" in pred and pred["relative_pose"] is not None:
+                    T_rel = pred["relative_pose"].clone().cpu()  # (B, 4, 4)
+                    # T_rel represents transform from current frame to previous frame (curr -> prev)
+                    # To get current frame pose: T_c2w_curr = T_c2w_prev @ T_rel_inv
+                    # where T_rel_inv is from previous to current (prev -> curr)
+                    T_rel_inv = torch.inverse(T_rel.float()).to(T_rel.dtype)
+                    prev_T_c2w = torch.bmm(prev_T_c2w, T_rel_inv)
+                else:
+                    # If relative_pose is missing for this frame, keep previous pose
+                    # (or could use direct camera_pose as fallback)
+                    pass
+            
+            pr_poses.append(prev_T_c2w.clone())
+        
+        print(f"Using accumulated camera poses from relative_pose ({len(pr_poses)} frames)")
+    else:
+        # Use direct camera_pose
+        pr_poses = [
+            pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
+            for pred in outputs["pred"]
+        ]
+        print(f"Using direct camera_pose ({len(pr_poses)} frames)")
     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
     t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
 
@@ -338,7 +407,7 @@ def run_inference(args):
     add_path_to_dust3r(args.model_path)
 
     # Import model and inference functions after adding the ckpt path.
-    from src.dust3r.inference import inference, inference_recurrent
+    from src.dust3r.inference import inference, inference_recurrent, inference_recurrent_lighter
     from src.dust3r.model import ARCroco3DStereo
     from viser_utils import PointCloudViewer
 
@@ -371,7 +440,7 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, state_args = inference(views, model, device)
+    outputs, state_args = inference_recurrent(views, model, device)
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
     print(
@@ -380,8 +449,19 @@ def run_inference(args):
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
+    # Determine use_relative_pose based on command-line arguments
+    if args.use_relative_pose and args.no_relative_pose:
+        print("Warning: Both --use_relative_pose and --no_relative_pose specified. --no_relative_pose takes precedence.")
+        use_relative_pose = False
+    elif args.use_relative_pose:
+        use_relative_pose = True
+    elif args.no_relative_pose:
+        use_relative_pose = False
+    else:
+        use_relative_pose = None  # Auto-detect
+    
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True
+        outputs, args.output_dir, 1, True, use_relative_pose=use_relative_pose
     )
 
     # Convert tensors to numpy arrays for visualization.
@@ -402,7 +482,8 @@ def run_inference(args):
         edge_color_list=edge_colors,
         show_camera=True,
         vis_threshold=args.vis_threshold,
-        size = args.size
+        size=args.size,
+        downsample_factor=args.downsample_factor
     )
     viewer.run()
 

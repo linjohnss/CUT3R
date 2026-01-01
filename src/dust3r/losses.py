@@ -758,6 +758,76 @@ class Regr3DPose(Criterion, MultiLoss):
             )
 
         return pose_loss
+    
+    def compute_relative_pose_token_loss(self, gt_poses, preds):
+        """Compute relative pose token loss from predictions.
+        
+        Args:
+            gt_poses: List of tuples (trans, quat) for each view, where:
+                - trans: (B, 3) translation
+                - quat: (B, 4) quaternion rotation
+            preds: List of prediction dictionaries
+            
+        Returns:
+            avg_relative_pose_token_loss: Average relative pose token loss
+            loss_value: Float value for logging
+        """
+        from dust3r.utils.camera import (
+            quaternion_to_matrix,
+            rotation_matrix_to_9d,
+        )
+        
+        relative_pose_token_losses = []
+        for i in range(1, len(preds)):
+            # 檢查是否有 relative_pose
+            if "relative_pose" not in preds[i]:
+                continue
+                
+            pred_rel_pose = preds[i]["relative_pose"]  # (B, 4, 4) SE(3) matrix
+            
+            # GT pose 格式是 (trans, quat)，需要轉換成 9D rotation
+            gt_trans_prev = gt_poses[i-1][0]  # (B, 3)
+            gt_quat_prev = gt_poses[i-1][1]    # (B, 4) quaternion
+            gt_trans_curr = gt_poses[i][0]     # (B, 3)
+            gt_quat_curr = gt_poses[i][1]      # (B, 4) quaternion
+            
+            # 將 quaternion 轉換成 3x3 rotation matrix，然後轉成 9D
+            gt_R_prev = quaternion_to_matrix(gt_quat_prev)  # (B, 3, 3)
+            gt_R_curr = quaternion_to_matrix(gt_quat_curr)  # (B, 3, 3)
+            
+            # 計算 GT 的相對姿態 (R_rel = R_curr^T @ R_prev)
+            gt_R_rel = torch.bmm(gt_R_curr.transpose(-2, -1), gt_R_prev)  # (B, 3, 3)
+            
+            # 將 GT relative rotation 轉換成 9D
+            gt_rot_9d_rel = rotation_matrix_to_9d(gt_R_rel)  # (B, 9)
+            
+            # 相對平移：t_rel = R_curr^T @ (t_prev - t_curr)
+            delta_trans = gt_trans_prev - gt_trans_curr
+            gt_rel_trans = torch.bmm(gt_R_curr.transpose(-2, -1), delta_trans.unsqueeze(-1)).squeeze(-1)  # (B, 3)
+            
+            # 提取預測的 relative pose (pred_rel_pose 是 4x4 矩陣)
+            pred_rel_trans = pred_rel_pose[:, :3, 3]  # (B, 3)
+            pred_rel_rot_matrix = pred_rel_pose[:, :3, :3]  # (B, 3, 3)
+            
+            # 將預測的 relative rotation 轉換成 9D
+            pred_rot_9d_rel = rotation_matrix_to_9d(pred_rel_rot_matrix)  # (B, 9)
+            
+            # 在 9D 空間計算相對姿態 loss
+            rel_pose_token_loss = (
+                torch.abs(pred_rel_trans - gt_rel_trans).mean() +
+                torch.abs(pred_rot_9d_rel - gt_rot_9d_rel).mean() * 40.0
+            )
+
+            relative_pose_token_losses.append(rel_pose_token_loss)
+        
+        if relative_pose_token_losses:
+            avg_relative_pose_token_loss = torch.stack(relative_pose_token_losses).mean()
+            loss_value = float(avg_relative_pose_token_loss.item())
+        else:
+            avg_relative_pose_token_loss = torch.tensor(0.0, device=gt_poses[0][0].device)
+            loss_value = 0.0
+        
+        return avg_relative_pose_token_loss, loss_value
 
     def compute_loss(self, gts, preds, **kw):
         (
@@ -856,6 +926,10 @@ class Regr3DPose(Criterion, MultiLoss):
             np.arange(len(ls_self)).tolist() + np.arange(len(ls_cross)).tolist()
         )
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
+
+        # Compute relative pose token loss if relative_pose is available in predictions
+        avg_relative_pose_token_loss, relative_pose_token_loss_value = self.compute_relative_pose_token_loss(gt_poses, preds)
+        details["relative_pose_token_loss"] = avg_relative_pose_token_loss
 
         return Sum(*list(zip(ls, masks))), (details | monitoring)
 
@@ -1041,6 +1115,10 @@ class Regr3DPoseBatchList(Regr3DPose):
         pose_masks = pose_masks * gts[i]["img_mask"]
         details["pose_loss"] = self.compute_pose_loss(gt_poses, pr_poses, pose_masks)
 
+        # Compute relative pose token loss if relative_pose is available in predictions
+        avg_relative_pose_token_loss, relative_pose_token_loss_value = self.compute_relative_pose_token_loss(gt_poses, preds)
+        details["relative_pose_token_loss"] = avg_relative_pose_token_loss
+
         return Sum(*list(zip(ls, masks))), (details | monitoring)
 
 
@@ -1114,6 +1192,9 @@ class ConfLoss(MultiLoss):
             final_loss = (
                 final_loss + details["pose_loss"] #.clip(max=0.3) * 5.0
             )  # , details
+        if "relative_pose_token_loss" in details:
+            # Add relative_pose_token_loss to final loss (computed when pose_head=True)
+            final_loss = final_loss + details["relative_pose_token_loss"]
         if "scale_loss" in details:
             final_loss = final_loss + details["scale_loss"]
         return final_loss, details

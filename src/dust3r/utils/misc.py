@@ -29,6 +29,14 @@ def freeze_all_params(modules):
 
             module.requires_grad = False
 
+def fix_all_params(modules):
+    for module in modules:
+        try:
+            for n, param in module.named_parameters():
+                param._is_frozen = True
+        except AttributeError:
+            module._is_frozen = True
+
 
 def is_symmetrized(gt1, gt2):
     x = gt1["instance"]

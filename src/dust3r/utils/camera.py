@@ -43,6 +43,136 @@ class PoseDecoder(nn.Module):
         return pred_cameras
 
 
+class RelativePoseDecoder(nn.Module):
+    def __init__(
+        self,
+        hidden_size=768,
+        mlp_ratio=4,
+        pose_encoding_type="absT_rot9d",
+        num_prompt_tokens=8,
+    ):
+        super().__init__()
+
+        self.pose_encoding_type = pose_encoding_type
+        self.hidden_size = hidden_size
+        self.num_prompt_tokens = num_prompt_tokens
+        
+        # Unified MLP: process all tokens together (similar to camera_head.py's more_mlps)
+        input_dim = num_prompt_tokens * hidden_size  # tokens flattened
+        output_dim = int(num_prompt_tokens * hidden_size)  # Use same dimension as input
+        
+        self.more_mlps = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim),
+            nn.ReLU()
+        )
+        
+        # Separate linear heads for translation and rotation (similar to camera_head.py)
+        self.fc_t = nn.Linear(output_dim, 3)  # Translation head
+        self.fc_rot = nn.Linear(output_dim, 9)  # Rotation head (9D)
+
+    def orthogonalize_rotation(self, R):
+        """
+        Orthogonalize rotation matrix using SVD (differentiable).
+        Ensures the output is a valid rotation matrix with det(R) = +1.
+        
+        Note: SVD and det operations don't support bfloat16 on CUDA,
+        so we wrap the entire computation in float32 context.
+        
+        Args:
+            R: (B, 3, 3) potentially non-orthogonal matrices
+            
+        Returns:
+            R_ortho: (B, 3, 3) orthogonalized rotation matrices
+        """
+        # Save original dtype and device
+        original_dtype = R.dtype
+        device = R.device
+        
+        # Force float32 computation for all operations
+        with torch.cuda.amp.autocast(enabled=False):
+            # Convert to float32
+            m = R.float()
+            
+            # Pi3's svd_orthogonalize algorithm
+            # 1. Reshape if needed
+            if m.dim() < 3:
+                m = m.reshape((-1, 3, 3))
+            
+            # 2. Normalize each row and transpose
+            m_normalized = torch.nn.functional.normalize(m, p=2, dim=-1)
+            m_transpose = torch.transpose(m_normalized, dim0=-1, dim1=-2)
+
+            m_transpose = m_transpose.cpu()
+            
+            # 3. SVD decomposition: M^T = U @ S @ V^T
+            u, s, v = torch.svd(m_transpose)
+
+            u = u.to(device)
+            v = v.to(device)
+            
+            # 4. Compute determinant to check orientation
+            det = torch.det(torch.matmul(v, u.transpose(-2, -1)))
+            
+            # 5. Build rotation matrix: R = V @ U^T (adjust last column if det < 0)
+            r = torch.matmul(
+                torch.cat([v[:, :, :-1], v[:, :, -1:] * det.view(-1, 1, 1)], dim=2),
+                u.transpose(-2, -1)
+            )
+            
+            R_ortho = r
+        
+        # Convert back to original dtype if needed
+        if original_dtype == torch.bfloat16:
+            R_ortho = R_ortho.to(original_dtype)
+        
+        return R_ortho
+
+    def forward(
+        self,
+        pose_feat,
+    ):
+        """
+        Forward pass to predict relative pose from prompt tokens.
+        
+        Args:
+            pose_feat: (B, num_prompt_tokens, hidden_size) - pose tokens
+            
+        Returns:
+            T_rel: (B, 4, 4) relative SE(3) transform (camera-to-world convention,
+                   to be composed with previous T_c2w)
+        """
+        B, num_tokens, hidden_dim = pose_feat.shape
+        assert num_tokens == self.num_prompt_tokens, f"Expected {self.num_prompt_tokens} tokens, got {num_tokens}"
+        
+        # Flatten all tokens into a single vector (similar to camera_head.py)
+        feat = pose_feat.reshape(B, -1)  # (B, num_prompt_tokens * hidden_size)
+        
+        # Pass through unified MLP (similar to camera_head.py's more_mlps)
+        feat = self.more_mlps(feat)  # (B, output_dim)
+        
+        # Use separate linear heads for translation and rotation (similar to camera_head.py)
+        # Use float32 for pose prediction to avoid numerical issues (like camera_head.py)
+        with torch.cuda.amp.autocast(enabled=False):
+            rel_trans = self.fc_t(feat.float())  # (B, 3)
+            rel_rot_9d = self.fc_rot(feat.float())  # (B, 9)
+        
+        # Reshape to 3x3 matrix and orthogonalize, then build a 4x4 SE(3) matrix
+        rel_rot_matrix = rel_rot_9d.reshape(-1, 3, 3)  # (B, 3, 3)
+        rel_rot_matrix = self.orthogonalize_rotation(rel_rot_matrix)  # (B, 3, 3)
+        
+        # Convert to 4x4 SE(3) matrix (similar to camera_head.py's convert_pose_to_4x4)
+        device = rel_trans.device
+        dtype = rel_trans.dtype
+        T_rel = torch.zeros((B, 4, 4), device=device, dtype=dtype)
+        T_rel[:, :3, :3] = rel_rot_matrix
+        T_rel[:, :3, 3] = rel_trans
+        T_rel[:, 3, 3] = 1.0
+        
+        return T_rel
+
+
 class PoseEncoder(nn.Module):
     def __init__(
         self,
@@ -448,6 +578,75 @@ def rotate_vector(q, v):
     t = 2.0 * torch.cross(q_vec, v, dim=-1)
     v_rot = v + q_w * t + torch.cross(q_vec, t, dim=-1)
     return v_rot
+
+
+def rotation_matrix_to_9d(R: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 3x3 rotation matrix to 9D vector (flatten).
+    
+    Args:
+        R: (B, 3, 3) rotation matrix
+        
+    Returns:
+        rot_9d: (B, 9) flattened rotation matrix
+    """
+    return R.reshape(*R.shape[:-2], 9)
+
+
+def rotation_9d_to_matrix(rot_9d: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 9D vector to 3x3 rotation matrix (reshape).
+    
+    Args:
+        rot_9d: (B, 9) flattened rotation matrix
+        
+    Returns:
+        R: (B, 3, 3) rotation matrix
+    """
+    return rot_9d.reshape(*rot_9d.shape[:-1], 3, 3)
+
+
+def pose_12d_to_matrix(pose_12d: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 12D pose representation (3 translation + 9D rotation) to 4x4 matrix.
+
+    Args:
+        pose_12d: (..., 12) where last 12 = [tx, ty, tz, rot_9d]
+
+    Returns:
+        T: (..., 4, 4) SE(3) matrix
+    """
+    from dust3r.utils.camera import rotation_9d_to_matrix
+
+    trans = pose_12d[..., :3]
+    rot_9d = pose_12d[..., 3:12]
+    R = rotation_9d_to_matrix(rot_9d)
+
+    T = torch.eye(4, device=pose_12d.device, dtype=pose_12d.dtype)
+    # Broadcast to batch by expanding
+    expand_shape = (*pose_12d.shape[:-1], 4, 4)
+    T = T.expand(expand_shape).clone()
+    T[..., :3, :3] = R
+    T[..., :3, 3] = trans
+    return T
+
+
+def pose_matrix_to_12d(T: torch.Tensor) -> torch.Tensor:
+    """
+    Convert 4x4 pose matrix to 12D representation (3 translation + 9D rotation).
+
+    Args:
+        T: (..., 4, 4) SE(3) matrix
+
+    Returns:
+        pose_12d: (..., 12) where last 12 = [tx, ty, tz, rot_9d]
+    """
+    from dust3r.utils.camera import rotation_matrix_to_9d
+
+    trans = T[..., :3, 3]
+    R = T[..., :3, :3]
+    rot_9d = rotation_matrix_to_9d(R)
+    return torch.cat([trans, rot_9d], dim=-1)
 
 
 def relative_pose_absT_quatR(t1, q1, t2, q2):

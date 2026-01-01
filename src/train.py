@@ -21,6 +21,8 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from dust3r.utils.device import todevice
+
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
 from dust3r.model import (
@@ -196,7 +198,7 @@ def train(args):
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=False)
         load_only_encoder = getattr(args, "load_only_encoder", False)
         if load_only_encoder:
             filtered_state_dict = {
@@ -584,6 +586,7 @@ def test_one_epoch(
     for _, batch in enumerate(
         metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
     ):
+        batch = todevice(batch, device)
         result = loss_of_one_batch(
             batch,
             model,
