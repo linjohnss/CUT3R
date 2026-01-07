@@ -70,15 +70,22 @@ class RelativePoseDecoder(nn.Module):
         
         # Separate linear heads for translation and rotation (similar to camera_head.py)
         self.fc_t = nn.Linear(output_dim, 3)  # Translation head
-        self.fc_rot = nn.Linear(output_dim, 9)  # Rotation head (9D)
+        self.fc_rot = nn.Linear(output_dim, 6)  # Rotation head (6D: 2 rows of 3)
+        
+        # Initialize rotation head to output Identity matrix (first 2 rows)
+        # [1, 0, 0, 0, 1, 0]
+        nn.init.zeros_(self.fc_rot.weight)
+        identity_6d = torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float)
+        self.fc_rot.bias.data.copy_(identity_6d)
+        
+        # Translation head can be zero-initialized
+        nn.init.zeros_(self.fc_t.weight)
+        nn.init.zeros_(self.fc_t.bias)
 
     def orthogonalize_rotation(self, R):
         """
-        Orthogonalize rotation matrix using SVD (differentiable).
-        Ensures the output is a valid rotation matrix with det(R) = +1.
-        
-        Note: SVD and det operations don't support bfloat16 on CUDA,
-        so we wrap the entire computation in float32 context.
+        Orthogonalize rotation matrix using Gram-Schmidt (6D representation).
+        Uses the first two columns to construct a valid rotation matrix.
         
         Args:
             R: (B, 3, 3) potentially non-orthogonal matrices
@@ -86,46 +93,24 @@ class RelativePoseDecoder(nn.Module):
         Returns:
             R_ortho: (B, 3, 3) orthogonalized rotation matrices
         """
-        # Save original dtype and device
-        original_dtype = R.dtype
-        device = R.device
+        # R is (B, 3, 3)
+        # Use ROWS (vectors 0-2 and 3-5 of the 9D output)
+        x = R[:, 0] # First row
+        y = R[:, 1] # Second row
         
-        # Force float32 computation for all operations
-        with torch.cuda.amp.autocast(enabled=False):
-            # Convert to float32
-            m = R.float()
-            
-            # Pi3's svd_orthogonalize algorithm
-            # 1. Reshape if needed
-            if m.dim() < 3:
-                m = m.reshape((-1, 3, 3))
-            
-            # 2. Normalize each row and transpose
-            m_normalized = torch.nn.functional.normalize(m, p=2, dim=-1)
-            m_transpose = torch.transpose(m_normalized, dim0=-1, dim1=-2)
-
-            m_transpose = m_transpose.cpu()
-            
-            # 3. SVD decomposition: M^T = U @ S @ V^T
-            u, s, v = torch.svd(m_transpose)
-
-            u = u.to(device)
-            v = v.to(device)
-            
-            # 4. Compute determinant to check orientation
-            det = torch.det(torch.matmul(v, u.transpose(-2, -1)))
-            
-            # 5. Build rotation matrix: R = V @ U^T (adjust last column if det < 0)
-            r = torch.matmul(
-                torch.cat([v[:, :, :-1], v[:, :, -1:] * det.view(-1, 1, 1)], dim=2),
-                u.transpose(-2, -1)
-            )
-            
-            R_ortho = r
+        # Normalize x
+        x_n = F.normalize(x, dim=-1)
         
-        # Convert back to original dtype if needed
-        if original_dtype == torch.bfloat16:
-            R_ortho = R_ortho.to(original_dtype)
+        # Project y onto x and subtract to make orthogonal
+        # z = cross(x_n, y) -> Direction of Third row
+        z = torch.cross(x_n, y, dim=-1)
+        z_n = F.normalize(z, dim=-1)
+        
+        # Recompute y to ensure orthogonality (z_n cross x_n)
+        y_n = torch.cross(z_n, x_n, dim=-1)
+        
+        # Stack as ROWS: [x_n, y_n, z_n] -> (B, 3, 3)
+        R_ortho = torch.stack([x_n, y_n, z_n], dim=1)
         
         return R_ortho
 
@@ -156,10 +141,10 @@ class RelativePoseDecoder(nn.Module):
         # Use float32 for pose prediction to avoid numerical issues (like camera_head.py)
         with torch.cuda.amp.autocast(enabled=False):
             rel_trans = self.fc_t(feat.float())  # (B, 3)
-            rel_rot_9d = self.fc_rot(feat.float())  # (B, 9)
+            rel_rot_6d = self.fc_rot(feat.float())  # (B, 6)
         
-        # Reshape to 3x3 matrix and orthogonalize, then build a 4x4 SE(3) matrix
-        rel_rot_matrix = rel_rot_9d.reshape(-1, 3, 3)  # (B, 3, 3)
+        # Reshape to 2x3 matrix (first two rows) and orthogonalize
+        rel_rot_matrix = rel_rot_6d.reshape(-1, 2, 3)  # (B, 2, 3)
         rel_rot_matrix = self.orthogonalize_rotation(rel_rot_matrix)  # (B, 3, 3)
         
         # Convert to 4x4 SE(3) matrix (similar to camera_head.py's convert_pose_to_4x4)

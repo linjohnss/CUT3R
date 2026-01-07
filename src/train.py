@@ -797,9 +797,14 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
     for i in range(0, num_views, stride):
         gt_imgs = 0.5 * (loss_details[f"gt_img{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
         width = gt_imgs.shape[2]
-        pred_imgs = (
-            0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        )
+        # Handle case where RGBLoss is not used (pred_rgb not available)
+        if f"pred_rgb_{i+1}" in loss_details:
+            pred_imgs = (
+                0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
+            )
+        else:
+            # Fallback: use zeros as placeholder when no RGB prediction
+            pred_imgs = torch.zeros_like(gt_imgs)
         gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
         pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
 

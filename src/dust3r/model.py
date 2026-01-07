@@ -309,10 +309,45 @@ class ARCroco3DStereo(CroCoNet):
         )
         self.set_freeze(config.freeze)
 
+        # Patch decoder blocks to support attention masks (for backward compatibility with old checkpoints)
+        self._patch_decoder_blocks_for_masks()
+
+    def _patch_decoder_blocks_for_masks(self):
+        """Patch decoder blocks to support attention masks with **kwargs.
+
+        This is needed for backward compatibility when loading old checkpoints
+        where DecoderBlock.forward() doesn't have mask parameters.
+        """
+        from functools import wraps
+
+        def make_forward_with_kwargs(original_forward):
+            @wraps(original_forward)
+            def forward_with_kwargs(x, y, xpos, ypos, **kwargs):
+                # Try to call with mask parameters, fall back to original if not supported
+                try:
+                    return original_forward(x, y, xpos, ypos, **kwargs)
+                except TypeError:
+                    # Old version without mask support, just ignore kwargs
+                    return original_forward(x, y, xpos, ypos)
+            return forward_with_kwargs
+
+        # Patch all decoder blocks
+        if hasattr(self, 'dec_blocks'):
+            for blk in self.dec_blocks:
+                blk.forward = make_forward_with_kwargs(blk.forward)
+
+        if hasattr(self, 'dec_blocks_state'):
+            for blk in self.dec_blocks_state:
+                blk.forward = make_forward_with_kwargs(blk.forward)
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
         if os.path.isfile(pretrained_model_name_or_path):
-            return load_model(pretrained_model_name_or_path, device="cpu")
+            model = load_model(pretrained_model_name_or_path, device="cpu")
+            # Patch the loaded model
+            if hasattr(model, '_patch_decoder_blocks_for_masks'):
+                model._patch_decoder_blocks_for_masks()
+            return model
         else:
             try:
                 model = super(ARCroco3DStereo, cls).from_pretrained(
@@ -696,14 +731,43 @@ class ARCroco3DStereo(CroCoNet):
         final_output = [(f_state, f_img)]  # before projection
         assert f_state.shape[-1] == self.dec_embed_dim
         f_img = self.decoder_embed(f_img)
+
+        # Construct attention masks to prevent rel_pose from affecting CUT3R
+        img_self_attn_mask = None
+        state_cross_attn_mask = None
+
         if self.pose_head_flag:
             assert f_pose is not None and pos_pose is not None
             if f_rel_pose is not None and pos_rel_pose is not None:
+                # Record token counts before concatenation
+                n_pose = f_pose.shape[1]  # 1
+                n_img = f_img.shape[1]  # number of image tokens after decoder_embed
+                n_rel_pose = f_rel_pose.shape[1]  # num_prompt_tokens
+                total_tokens = n_pose + n_img + n_rel_pose
+
+                # Concatenate tokens
                 f_img = torch.cat([f_pose, f_img, f_rel_pose], dim=1)
                 pos_img = torch.cat([pos_pose, pos_img, pos_rel_pose], dim=1)
+
+                # Construct masks
+
+                # Self-attention mask for blk_img: [pose, img] cannot attend to rel_pose
+                # Shape: (total_tokens, total_tokens), True = allow, False = block
+                img_self_attn_mask = torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=f_img.device)
+                # Block: pose and img cannot attend to rel_pose
+                img_self_attn_mask[:n_pose + n_img, n_pose + n_img:] = False
+                # Note: rel_pose can attend to everything (including self-attention among rel_pose)
+
+                # Cross-attention mask for blk_state: state cannot attend to rel_pose in f_img
+                # Shape: (n_state, total_tokens)
+                n_state = f_state.shape[1]
+                state_cross_attn_mask = torch.ones(n_state, total_tokens, dtype=torch.bool, device=f_state.device)
+                # Block: state cannot attend to rel_pose
+                state_cross_attn_mask[:, n_pose + n_img:] = False
             else:
                 f_img = torch.cat([f_pose, f_img], dim=1)
                 pos_img = torch.cat([pos_pose, pos_img], dim=1)
+
         final_output.append((f_state, f_img))
         for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
             if (
@@ -711,6 +775,7 @@ class ARCroco3DStereo(CroCoNet):
                 and self.training
                 and torch.is_grad_enabled()
             ):
+                # Note: checkpoint doesn't support extra kwargs well, skip mask for now in checkpoint mode
                 f_state, _ = checkpoint(
                     blk_state,
                     *final_output[-1][::+1],
@@ -726,8 +791,20 @@ class ARCroco3DStereo(CroCoNet):
                     use_reentrant=not self.fixed_input_length,
                 )
             else:
-                f_state, _ = blk_state(*final_output[-1][::+1], pos_state, pos_img)
-                f_img, _ = blk_img(*final_output[-1][::-1], pos_img, pos_state)
+                f_state, _ = blk_state(
+                    *final_output[-1][::+1],
+                    pos_state,
+                    pos_img,
+                    self_attn_mask=None,  # state self-attention no need to mask
+                    cross_attn_mask=state_cross_attn_mask
+                )
+                f_img, _ = blk_img(
+                    *final_output[-1][::-1],
+                    pos_img,
+                    pos_state,
+                    self_attn_mask=img_self_attn_mask,
+                    cross_attn_mask=None  # f_img cross-attend to f_state, no need to mask
+                )
             final_output.append((f_state, f_img))
         del final_output[1]  # duplicate with final_output[0]
         final_output[-1] = (
