@@ -99,7 +99,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, x, xpos):
+    def forward(self, x, xpos, attn_mask=None):
         B, N, C = x.shape
 
         qkv = (
@@ -122,7 +122,7 @@ class Attention(nn.Module):
 
         x = (
             scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                query=q, key=k, value=v, attn_mask=attn_mask, dropout_p=self.attn_drop.p, scale=self.scale
             )
             .transpose(1, 2)
             .reshape(B, N, C)
@@ -194,7 +194,7 @@ class CrossAttention(nn.Module):
 
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, attn_mask=None):
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
@@ -232,7 +232,7 @@ class CrossAttention(nn.Module):
 
         x = (
             scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                query=q, key=k, value=v, attn_mask=attn_mask, dropout_p=self.attn_drop.p, scale=self.scale
             )
             .transpose(1, 2)
             .reshape(B, Nq, C)
@@ -289,10 +289,10 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+    def forward(self, x, y, xpos, ypos, self_attn_mask=None, cross_attn_mask=None):
+        x = x + self.drop_path(self.attn(self.norm1(x), xpos, attn_mask=self_attn_mask))
         y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
+        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, attn_mask=cross_attn_mask))
         x = x + self.drop_path(self.mlp(self.norm3(x)))
         return x, y
 

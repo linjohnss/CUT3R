@@ -108,7 +108,10 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, x, xpos):
+    def forward(self, x, xpos, **kwargs):
+        # Extract mask from kwargs for backward compatibility
+        attn_mask = kwargs.get('attn_mask', None)
+
         B, N, C = x.shape
 
         qkv = (
@@ -138,7 +141,7 @@ class Attention(nn.Module):
         # x = memory_efficient_attention(query=q.permute(0, 2, 1, 3), key=k.permute(0, 2, 1, 3), value=v.permute(0, 2, 1, 3), p=self.attn_drop.p, scale=self.scale).reshape(B, N, C)
         x = (
             scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                query=q, key=k, value=v, attn_mask=attn_mask, dropout_p=self.attn_drop.p, scale=self.scale
             )
             .transpose(1, 2)
             .reshape(B, N, C)
@@ -209,7 +212,10 @@ class CrossAttention(nn.Module):
 
         self.rope = rope.float() if rope is not None else None
 
-    def forward(self, query, key, value, qpos, kpos):
+    def forward(self, query, key, value, qpos, kpos, **kwargs):
+        # Extract mask from kwargs for backward compatibility
+        attn_mask = kwargs.get('attn_mask', None)
+
         B, Nq, C = query.shape
         Nk = key.shape[1]
         Nv = value.shape[1]
@@ -254,7 +260,7 @@ class CrossAttention(nn.Module):
         # x = memory_efficient_attention(query=q.permute(0, 2, 1, 3), key=k.permute(0, 2, 1, 3), value=v.permute(0, 2, 1, 3), p=self.attn_drop.p, scale=self.scale).reshape(B, Nq, C)
         x = (
             scaled_dot_product_attention(
-                query=q, key=k, value=v, dropout_p=self.attn_drop.p, scale=self.scale
+                query=q, key=k, value=v, attn_mask=attn_mask, dropout_p=self.attn_drop.p, scale=self.scale
             )
             .transpose(1, 2)
             .reshape(B, Nq, C)
@@ -311,10 +317,14 @@ class DecoderBlock(nn.Module):
         )
         self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
 
-    def forward(self, x, y, xpos, ypos):
-        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+    def forward(self, x, y, xpos, ypos, **kwargs):
+        # Extract mask parameters from kwargs for backward compatibility
+        self_attn_mask = kwargs.get('self_attn_mask', None)
+        cross_attn_mask = kwargs.get('cross_attn_mask', None)
+
+        x = x + self.drop_path(self.attn(self.norm1(x), xpos, attn_mask=self_attn_mask))
         y_ = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
+        x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, attn_mask=cross_attn_mask))
         x = x + self.drop_path(self.mlp(self.norm3(x)))
         return x, y
 

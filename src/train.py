@@ -853,14 +853,27 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
             )
             self_view_conf_exits = True
 
-        img_mask_list = batch_append(
-            img_mask_list,
-            loss_details[f"img_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
-        )
-        ray_mask_list = batch_append(
-            ray_mask_list,
-            loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
-        )
+        if f"img_mask_{i+1}" in loss_details and f"ray_mask_{i+1}" in loss_details:
+            img_mask_list = batch_append(
+                img_mask_list,
+                loss_details[f"img_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
+            )
+            ray_mask_list = batch_append(
+                ray_mask_list,
+                loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
+            )
+        else:
+            # Create placeholder masks (all False) when masks are not available
+            batch_size = gt_imgs.shape[0]
+            placeholder_mask = torch.zeros(batch_size, dtype=torch.bool)
+            img_mask_list = batch_append(
+                img_mask_list,
+                placeholder_mask.unbind(dim=0),
+            )
+            ray_mask_list = batch_append(
+                ray_mask_list,
+                placeholder_mask.unbind(dim=0),
+            )
 
     # each element in the list is [H, num_views * W, (3)], the size of the list is num_imgs_vis
     gt_img_list = [torch.cat(sublist, dim=1) for sublist in gt_img_list]

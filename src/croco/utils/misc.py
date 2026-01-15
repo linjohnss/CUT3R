@@ -423,7 +423,7 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
                 args.resume, map_location="cpu", check_hash=True
             )
         else:
-            checkpoint = torch.load(args.resume, map_location="cpu")
+            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         printer.info("Resume checkpoint %s" % args.resume)
         model_without_ddp.load_state_dict(checkpoint["model"], strict=False)
         args.start_epoch = checkpoint["epoch"] + 1
@@ -523,6 +523,8 @@ def get_parameter_groups(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue  # frozen weights
+        if hasattr(param, '_is_frozen') and param._is_frozen:
+            continue  # fixed weights (gradients computed but not updated)
 
         # Assign weight decay values
         if len(param.shape) == 1 or name.endswith(".bias") or name in skip_list:
