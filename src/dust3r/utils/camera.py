@@ -50,111 +50,228 @@ class RelativePoseDecoder(nn.Module):
         mlp_ratio=4,
         pose_encoding_type="absT_rot9d",
         num_prompt_tokens=8,
+        num_attn_heads=8,
     ):
         super().__init__()
 
         self.pose_encoding_type = pose_encoding_type
         self.hidden_size = hidden_size
         self.num_prompt_tokens = num_prompt_tokens
-        
-        # Unified MLP: process all tokens together (similar to camera_head.py's more_mlps)
-        input_dim = num_prompt_tokens * hidden_size  # tokens flattened
-        output_dim = int(num_prompt_tokens * hidden_size)  # Use same dimension as input
-        
-        self.more_mlps = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU(),
-            nn.Linear(output_dim, output_dim),
-            nn.ReLU()
+        self.num_attn_heads = num_attn_heads
+
+        # =====================================================================
+        # Cross-Attention to Previous Pose Token
+        # =====================================================================
+        # Prompt tokens (query) attend to previous pose token (key/value)
+        # This conditions current predictions on previous frame's context
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_attn_heads,
+            batch_first=True,
+            dropout=0.0,
         )
-        
-        # Separate linear heads for translation and rotation (similar to camera_head.py)
-        self.fc_t = nn.Linear(output_dim, 3)  # Translation head
-        self.fc_rot = nn.Linear(output_dim, 6)  # Rotation head (6D: 2 rows of 3)
-        
+        self.norm_cross_q = nn.LayerNorm(hidden_size)
+        self.norm_cross_kv = nn.LayerNorm(hidden_size)
+
+        # =====================================================================
+        # Attention Pooling: Learnable queries for translation and rotation
+        # =====================================================================
+        # These queries learn to "ask" the prompt tokens for relevant information
+        # Translation query: learns to focus on tokens encoding displacement info
+        # Rotation query: learns to focus on tokens encoding orientation info
+        self.trans_query = nn.Parameter(
+            torch.randn(1, 1, hidden_size) * 0.02
+        )
+        self.rot_query = nn.Parameter(
+            torch.randn(1, 1, hidden_size) * 0.02
+        )
+
+        # Multi-head cross-attention for pooling
+        # Query: learnable query (1 token)
+        # Key/Value: prompt tokens (num_prompt_tokens tokens)
+        self.trans_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_attn_heads,
+            batch_first=True,
+            dropout=0.0,
+        )
+        self.rot_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_attn_heads,
+            batch_first=True,
+            dropout=0.0,
+        )
+
+        # Layer norms for attention pooling
+        self.norm_trans_q = nn.LayerNorm(hidden_size)
+        self.norm_rot_q = nn.LayerNorm(hidden_size)
+        self.norm_pool_kv = nn.LayerNorm(hidden_size)
+
+        # =====================================================================
+        # MLP for processing attention-pooled features
+        # =====================================================================
+        output_dim = int(hidden_size * mlp_ratio)
+
+        # Separate MLPs for translation and rotation pathways
+        self.trans_mlp = nn.Sequential(
+            nn.Linear(hidden_size, output_dim),
+            nn.GELU(),
+            nn.Linear(output_dim, output_dim),
+            nn.GELU(),
+        )
+        self.rot_mlp = nn.Sequential(
+            nn.Linear(hidden_size, output_dim),
+            nn.GELU(),
+            nn.Linear(output_dim, output_dim),
+            nn.GELU(),
+        )
+
+        # =====================================================================
+        # Output heads for translation and rotation
+        # =====================================================================
+        self.fc_t = nn.Linear(output_dim, 3)  # Translation head: 3D vector
+        self.fc_rot = nn.Linear(output_dim, 6)  # Rotation head: 6D representation (2 rows of 3)
+
         # Initialize rotation head to output Identity matrix (first 2 rows)
-        # [1, 0, 0, 0, 1, 0]
+        # Identity rotation in 6D: [1, 0, 0, 0, 1, 0]
         nn.init.zeros_(self.fc_rot.weight)
         identity_6d = torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float)
         self.fc_rot.bias.data.copy_(identity_6d)
-        
-        # Translation head can be zero-initialized
+
+        # Translation head: zero-initialized for identity transform
         nn.init.zeros_(self.fc_t.weight)
         nn.init.zeros_(self.fc_t.bias)
 
     def orthogonalize_rotation(self, R):
         """
         Orthogonalize rotation matrix using Gram-Schmidt (6D representation).
-        Uses the first two columns to construct a valid rotation matrix.
-        
+        Uses the first two rows to construct a valid rotation matrix.
+
         Args:
-            R: (B, 3, 3) potentially non-orthogonal matrices
-            
+            R: (B, 2, 3) - first two rows of rotation matrix
+
         Returns:
             R_ortho: (B, 3, 3) orthogonalized rotation matrices
         """
-        # R is (B, 3, 3)
-        # Use ROWS (vectors 0-2 and 3-5 of the 9D output)
-        x = R[:, 0] # First row
-        y = R[:, 1] # Second row
-        
-        # Normalize x
+        # R is (B, 2, 3) - first two rows
+        x = R[:, 0]  # First row (B, 3)
+        y = R[:, 1]  # Second row (B, 3)
+
+        # Normalize x to get first basis vector
         x_n = F.normalize(x, dim=-1)
-        
-        # Project y onto x and subtract to make orthogonal
-        # z = cross(x_n, y) -> Direction of Third row
+
+        # Compute z = cross(x_n, y) to get third basis vector direction
         z = torch.cross(x_n, y, dim=-1)
         z_n = F.normalize(z, dim=-1)
-        
-        # Recompute y to ensure orthogonality (z_n cross x_n)
+
+        # Recompute y to ensure orthogonality: y_n = cross(z_n, x_n)
         y_n = torch.cross(z_n, x_n, dim=-1)
-        
+
         # Stack as ROWS: [x_n, y_n, z_n] -> (B, 3, 3)
         R_ortho = torch.stack([x_n, y_n, z_n], dim=1)
-        
+
         return R_ortho
 
-    def forward(
-        self,
-        pose_feat,
-    ):
+    def forward(self, pose_feat, prev_pose_token=None):
         """
         Forward pass to predict relative pose from prompt tokens.
-        
+
+        Architecture:
+        1. Cross-attention: prompt tokens attend to previous pose token
+        2. Attention pooling: learnable queries aggregate updated prompt tokens
+        3. MLP processing and pose prediction
+
         Args:
-            pose_feat: (B, num_prompt_tokens, hidden_size) - pose tokens
-            
+            pose_feat: (B, num_prompt_tokens, hidden_size) - prompt tokens from decoder
+            prev_pose_token: (B, hidden_size) - previous frame's SINGLE pose token (optional)
+
         Returns:
-            T_rel: (B, 4, 4) relative SE(3) transform (camera-to-world convention,
-                   to be composed with previous T_c2w)
+            T_rel: (B, 4, 4) relative SE(3) transform
         """
         B, num_tokens, hidden_dim = pose_feat.shape
-        assert num_tokens == self.num_prompt_tokens, f"Expected {self.num_prompt_tokens} tokens, got {num_tokens}"
-        
-        # Flatten all tokens into a single vector (similar to camera_head.py)
-        feat = pose_feat.reshape(B, -1)  # (B, num_prompt_tokens * hidden_size)
-        
-        # Pass through unified MLP (similar to camera_head.py's more_mlps)
-        feat = self.more_mlps(feat)  # (B, output_dim)
-        
-        # Use separate linear heads for translation and rotation (similar to camera_head.py)
-        # Use float32 for pose prediction to avoid numerical issues (like camera_head.py)
+        assert num_tokens == self.num_prompt_tokens, \
+            f"Expected {self.num_prompt_tokens} tokens, got {num_tokens}"
+
+        # =====================================================================
+        # Step 1: Cross-attention to previous pose token
+        # =====================================================================
+        if prev_pose_token is not None:
+            # Normalize inputs
+            q = self.norm_cross_q(pose_feat)  # (B, num_prompt_tokens, hidden_size)
+            kv = self.norm_cross_kv(prev_pose_token.unsqueeze(1))  # (B, 1, hidden_size)
+
+            # Cross-attention: prompt tokens attend to previous pose token
+            pose_feat_attended, _ = self.cross_attn(
+                query=q,   # (B, num_prompt_tokens, hidden_size)
+                key=kv,    # (B, 1, hidden_size)
+                value=kv,  # (B, 1, hidden_size)
+            )  # Output: (B, num_prompt_tokens, hidden_size)
+
+            # Residual connection
+            pose_feat = pose_feat + pose_feat_attended
+
+        # =====================================================================
+        # Step 2: Attention Pooling - aggregate prompt tokens with learnable queries
+        # =====================================================================
+
+        # Normalize key/value (updated prompt tokens)
+        kv = self.norm_pool_kv(pose_feat)  # (B, num_prompt_tokens, hidden_size)
+
+        # Expand queries for batch dimension
+        trans_q = self.trans_query.expand(B, -1, -1)  # (B, 1, hidden_size)
+        rot_q = self.rot_query.expand(B, -1, -1)      # (B, 1, hidden_size)
+
+        # Normalize queries
+        trans_q = self.norm_trans_q(trans_q)
+        rot_q = self.norm_rot_q(rot_q)
+
+        # Cross-attention: learnable queries attend to prompt tokens
+        # Translation attention pooling
+        trans_feat, trans_attn_weights = self.trans_attn(
+            query=trans_q,  # (B, 1, hidden_size)
+            key=kv,         # (B, num_prompt_tokens, hidden_size)
+            value=kv,       # (B, num_prompt_tokens, hidden_size)
+        )  # trans_feat: (B, 1, hidden_size)
+
+        # Rotation attention pooling
+        rot_feat, rot_attn_weights = self.rot_attn(
+            query=rot_q,    # (B, 1, hidden_size)
+            key=kv,         # (B, num_prompt_tokens, hidden_size)
+            value=kv,       # (B, num_prompt_tokens, hidden_size)
+        )  # rot_feat: (B, 1, hidden_size)
+
+        # Squeeze the sequence dimension
+        trans_feat = trans_feat.squeeze(1)  # (B, hidden_size)
+        rot_feat = rot_feat.squeeze(1)      # (B, hidden_size)
+
+        # =====================================================================
+        # MLP processing for translation and rotation
+        # =====================================================================
+        trans_feat = self.trans_mlp(trans_feat)  # (B, output_dim)
+        rot_feat = self.rot_mlp(rot_feat)        # (B, output_dim)
+
+        # =====================================================================
+        # Predict translation and rotation
+        # =====================================================================
+        # Use float32 for pose prediction to avoid numerical issues with bfloat16
         with torch.cuda.amp.autocast(enabled=False):
-            rel_trans = self.fc_t(feat.float())  # (B, 3)
-            rel_rot_6d = self.fc_rot(feat.float())  # (B, 6)
-        
+            rel_trans = self.fc_t(trans_feat.float())     # (B, 3)
+            rel_rot_6d = self.fc_rot(rot_feat.float())    # (B, 6)
+
         # Reshape to 2x3 matrix (first two rows) and orthogonalize
         rel_rot_matrix = rel_rot_6d.reshape(-1, 2, 3)  # (B, 2, 3)
         rel_rot_matrix = self.orthogonalize_rotation(rel_rot_matrix)  # (B, 3, 3)
-        
-        # Convert to 4x4 SE(3) matrix (similar to camera_head.py's convert_pose_to_4x4)
+
+        # =====================================================================
+        # Construct SE(3) transformation matrix
+        # =====================================================================
         device = rel_trans.device
         dtype = rel_trans.dtype
         T_rel = torch.zeros((B, 4, 4), device=device, dtype=dtype)
         T_rel[:, :3, :3] = rel_rot_matrix
         T_rel[:, :3, 3] = rel_trans
         T_rel[:, 3, 3] = 1.0
-        
+
         return T_rel
 
 

@@ -11,15 +11,17 @@ Usage:
     python demo.py [--model_path MODEL_PATH] [--seq_path SEQ_PATH] [--size IMG_SIZE]
                             [--device DEVICE] [--vis_threshold VIS_THRESHOLD] [--output_dir OUT_DIR]
                             [--downsample_factor FACTOR] [--use_relative_pose] [--no_relative_pose]
+                            [--frame_interval INTERVAL] [--update_interval INTERVAL]
+                            [--max_frame MAX_FRAME]
 
 Example:
     python demo.py --model_path src/cut3r_512_dpt_4_64.pth \
         --seq_path examples/001 --device cuda --size 512
-    
+
     # Use relative pose accumulation (if available in model output)
     python demo.py --model_path src/checkpoints/prompt3r/checkpoint-best.pth \
         --seq_path examples/vkitti_scene01 --device cuda --use_relative_pose
-    
+
     # Force to use direct camera_pose (ignore relative_pose)
     python demo.py --model_path src/checkpoints/prompt3r/checkpoint-best.pth \
         --seq_path examples/vkitti_scene01 --device cuda --no_relative_pose
@@ -100,12 +102,32 @@ def parse_args():
         action="store_true",
         help="Force to use direct camera_pose instead of relative pose accumulation.",
     )
+    parser.add_argument(
+        "--frame_interval",
+        type=int,
+        default=1,
+        help="Frame interval for reading images from video or image sequence (default: 1, use every frame).",
+    )
+    parser.add_argument(
+        "--update_interval",
+        type=int,
+        default=1,
+        help="Update interval for state update (default: 1, update every frame). "
+             "Note: relative_pose is predicted relative to the previous updated frame.",
+    )
+    parser.add_argument(
+        "--max_frame",
+        type=int,
+        default=None,
+        help="Maximum number of frames to process (default: None, process all frames).",
+    )
 
     return parser.parse_args()
 
 
 def prepare_input(
-    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True
+    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True,
+    update_interval=1
 ):
     """
     Prepare input views for inference from a list of image paths.
@@ -118,6 +140,7 @@ def prepare_input(
         raymap_mask (list, optional): Flags indicating valid ray maps.
         revisit (int): How many times to revisit each view.
         update (bool): Whether to update the state on revisits.
+        update_interval (int): Interval for state updates (1 = update every frame).
 
     Returns:
         list: A list of view dictionaries.
@@ -131,6 +154,9 @@ def prepare_input(
     if raymaps is None and raymap_mask is None:
         # Only images are provided.
         for i in range(len(images)):
+            # Determine if this frame should update the state
+            # First frame always updates, then every update_interval frames
+            should_update = (i == 0) or (i % update_interval == 0)
             view = {
                 "img": images[i]["img"],
                 "ray_map": torch.full(
@@ -150,7 +176,7 @@ def prepare_input(
                 ),
                 "img_mask": torch.tensor(True).unsqueeze(0),
                 "ray_mask": torch.tensor(False).unsqueeze(0),
-                "update": torch.tensor(True).unsqueeze(0),
+                "update": torch.tensor(should_update).unsqueeze(0),
                 "reset": torch.tensor(False).unsqueeze(0),
             }
             views.append(view)
@@ -211,7 +237,8 @@ def prepare_input(
     return views
 
 
-def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None):
+def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None,
+                   update_interval=1):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
@@ -223,6 +250,8 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
             If None, will auto-detect based on model output.
             If True, will use relative pose if available.
             If False, will force to use direct camera_pose.
+        update_interval (int): Interval for state updates. relative_pose is predicted
+            relative to the previous updated frame.
 
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
@@ -242,7 +271,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
     conf_other = [output["conf"].cpu() for output in outputs["pred"]]
     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
 
-    # Determine whether to use relative_pose
+    # Determine pose accumulation method
     if use_relative_pose is None:
         # Auto-detect: check if relative_pose is available in predictions
         use_relative_pose = any("relative_pose" in pred and pred.get("relative_pose") is not None for pred in outputs["pred"])
@@ -252,34 +281,45 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
         if not has_relative_pose:
             print("Warning: --use_relative_pose specified but relative_pose not found in model output. Falling back to camera_pose.")
             use_relative_pose = False
-    
+
     if use_relative_pose:
         # Accumulate camera poses from relative_pose (4x4 matrix multiplication)
+        # Note: relative_pose is predicted relative to the previous UPDATED frame
         pr_poses = []
-        prev_T_c2w = None
-        
-        for i, pred in enumerate(outputs["pred"]):
+        prev_updated_T_c2w = None  # Pose of the last updated frame
+        curr_T_c2w = None  # Current accumulated pose
+
+        for i, (pred, view) in enumerate(zip(outputs["pred"], outputs["views"])):
+            # Check if this frame was an update frame
+            is_update_frame = (i == 0) or (i % update_interval == 0)
+
             if i == 0:
                 # First frame: use identity matrix (world frame origin)
                 B = pred["pts3d_in_self_view"].shape[0]
-                prev_T_c2w = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
+                curr_T_c2w = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
+                prev_updated_T_c2w = curr_T_c2w.clone()
             else:
                 # Subsequent frames: accumulate from relative_pose
+                # relative_pose is relative to the previous UPDATED frame
                 if "relative_pose" in pred and pred["relative_pose"] is not None:
                     T_rel = pred["relative_pose"].clone().cpu()  # (B, 4, 4)
-                    # T_rel represents transform from current frame to previous frame (curr -> prev)
-                    # To get current frame pose: T_c2w_curr = T_c2w_prev @ T_rel_inv
-                    # where T_rel_inv is from previous to current (prev -> curr)
+                    # T_rel represents transform from current frame to previous updated frame
+                    # To get current frame pose: T_c2w_curr = T_c2w_prev_updated @ T_rel_inv
                     T_rel_inv = torch.inverse(T_rel.float()).to(T_rel.dtype)
-                    prev_T_c2w = torch.bmm(prev_T_c2w, T_rel_inv)
+                    curr_T_c2w = torch.bmm(prev_updated_T_c2w, T_rel_inv)
                 else:
-                    # If relative_pose is missing for this frame, keep previous pose
-                    # (or could use direct camera_pose as fallback)
+                    # If relative_pose is missing, keep previous pose
                     pass
-            
-            pr_poses.append(prev_T_c2w.clone())
-        
-        print(f"Using accumulated camera poses from relative_pose ({len(pr_poses)} frames)")
+
+                # Update prev_updated_T_c2w if this is an update frame
+                if is_update_frame:
+                    prev_updated_T_c2w = curr_T_c2w.clone()
+
+            pr_poses.append(curr_T_c2w.clone())
+
+        # Count how many frames were update frames
+        num_update_frames = sum(1 for i in range(len(outputs["pred"])) if i == 0 or i % update_interval == 0)
+        print(f"Using accumulated camera poses from relative_pose ({len(pr_poses)} frames, {num_update_frames} update frames)")
     else:
         # Use direct camera_pose
         pr_poses = [
@@ -358,9 +398,16 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
     return pts3ds_other, colors, conf_other, cam_dict
 
 
-def parse_seq_path(p):
+def parse_seq_path(p, frame_interval=1):
     if os.path.isdir(p):
-        img_paths = sorted(glob.glob(f"{p}/*"))
+        # Only get image files (common image extensions)
+        img_extensions = ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']
+        img_paths = []
+        for ext in img_extensions:
+            img_paths.extend(glob.glob(f"{p}/{ext}"))
+        img_paths = sorted(img_paths)
+        # Apply frame_interval to image sequence
+        img_paths = img_paths[::frame_interval]
         tmpdirname = None
     else:
         cap = cv2.VideoCapture(p)
@@ -371,7 +418,6 @@ def parse_seq_path(p):
         if video_fps == 0:
             cap.release()
             raise ValueError(f"Error: Video FPS is 0 for {p}")
-        frame_interval = 1
         frame_indices = list(range(0, total_frames, frame_interval))
         print(
             f" - Video FPS: {video_fps}, Frame Interval: {frame_interval}, Total Frames to Read: {len(frame_indices)}"
@@ -407,17 +453,22 @@ def run_inference(args):
     add_path_to_dust3r(args.model_path)
 
     # Import model and inference functions after adding the ckpt path.
-    from src.dust3r.inference import inference, inference_recurrent, inference_recurrent_lighter
+    from src.dust3r.inference import inference, inference_recurrent
     from src.dust3r.model import ARCroco3DStereo
     from viser_utils import PointCloudViewer
 
     # Prepare image file paths.
-    img_paths, tmpdirname = parse_seq_path(args.seq_path)
+    img_paths, tmpdirname = parse_seq_path(args.seq_path, args.frame_interval)
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
 
-    print(f"Found {len(img_paths)} images in {args.seq_path}.")
+    # Apply max_frame limit if specified
+    if args.max_frame is not None and args.max_frame > 0:
+        img_paths = img_paths[:args.max_frame]
+        print(f"Limited to {len(img_paths)} frames (max_frame={args.max_frame}).")
+    else:
+        print(f"Found {len(img_paths)} images in {args.seq_path}.")
     img_mask = [True] * len(img_paths)
 
     # Prepare input views.
@@ -428,6 +479,7 @@ def run_inference(args):
         size=args.size,
         revisit=1,
         update=True,
+        update_interval=args.update_interval,
     )
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
@@ -449,7 +501,7 @@ def run_inference(args):
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
-    # Determine use_relative_pose based on command-line arguments
+    # Determine pose accumulation mode based on command-line arguments
     if args.use_relative_pose and args.no_relative_pose:
         print("Warning: Both --use_relative_pose and --no_relative_pose specified. --no_relative_pose takes precedence.")
         use_relative_pose = False
@@ -459,9 +511,10 @@ def run_inference(args):
         use_relative_pose = False
     else:
         use_relative_pose = None  # Auto-detect
-    
+
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True, use_relative_pose=use_relative_pose
+        outputs, args.output_dir, 1, True, use_relative_pose=use_relative_pose,
+        update_interval=args.update_interval
     )
 
     # Convert tensors to numpy arrays for visualization.

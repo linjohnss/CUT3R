@@ -960,7 +960,6 @@ class Regr3DPose(Criterion, MultiLoss):
         Loss design:
         - Translation: L1 loss
         - Rotation: 9D L1 loss (stable training)
-        - Weight: trans_loss + rot_loss * 40.0
 
         Args:
             gt_relative_poses: List of (gt_rel_trans, gt_rel_rot) for views 1..N-1
@@ -991,14 +990,14 @@ class Regr3DPose(Criterion, MultiLoss):
 
             # Rotation loss: 9D L1 loss (stable training)
             pred_rot_9d = rotation_matrix_to_9d(pr_rel_rot)  # (B, 9)
-            gt_rot_9d = rotation_matrix_to_9d(gt_R_rel)        # (B, 9)
+            gt_rot_9d = rotation_matrix_to_9d(gt_R_rel)      # (B, 9)
             rot_loss = torch.abs(pred_rot_9d - gt_rot_9d).mean()
             rot_losses.append(rot_loss)
 
         if trans_losses:
             avg_trans_loss = torch.stack(trans_losses).mean()
             avg_rot_loss = torch.stack(rot_losses).mean()
-            avg_relative_pose_token_loss = avg_trans_loss + avg_rot_loss * 40.0
+            avg_relative_pose_token_loss = avg_trans_loss + avg_rot_loss
         else:
             device = gt_relative_poses[0][0].device if gt_relative_poses and gt_relative_poses[0] is not None else "cpu"
             avg_relative_pose_token_loss = torch.tensor(0.0, device=device)

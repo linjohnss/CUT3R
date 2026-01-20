@@ -41,6 +41,7 @@ from dust3r.blocks import (
 
 inf = float("inf")
 from accelerate.logging import get_logger
+from einops import rearrange
 
 printer = get_logger(__name__, log_level="DEBUG")
 
@@ -117,6 +118,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         pose_head=False,
         num_prompt_tokens=8,
         use_mask_attention=True,
+        model_update_type="cut3r",  # "cut3r" or "ttt3r"
         **croco_kwargs,
     ):
         super().__init__()
@@ -139,6 +141,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.pose_head = pose_head
         self.num_prompt_tokens = num_prompt_tokens
         self.use_mask_attention = use_mask_attention
+        self.model_update_type = model_update_type
         self.croco_kwargs = croco_kwargs
 
 
@@ -216,14 +219,14 @@ class LocalMemory(nn.Module):
         feat_k = self.proj_q(feat_k)  # [B, 1, C]
         feat = torch.cat([feat_k, feat_v], dim=-1)
         for blk in self.write_blocks:
-            mem, _ = blk(mem, feat, None, None)
+            mem, _, _, _ = blk(mem, feat, None, None)
         return mem
 
     def inquire(self, query, mem):
         x = self.proj_q(query)  # [B, 1, C]
         x = torch.cat([x, self.masked_token.expand(x.shape[0], -1, -1)], dim=-1)
         for blk in self.read_blocks:
-            x, _ = blk(x, mem, None, None)
+            x, _, _, _ = blk(x, mem, None, None)
         return x[..., -self.v_dim :]
 
 
@@ -697,7 +700,7 @@ class ARCroco3DStereo(CroCoNet):
             full_pos.chunk(len(views), dim=0),
         )
 
-    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, f_rel_pose, pos_rel_pose):
+    def _decoder(self, f_state, pos_state, f_img, pos_img, f_pose, pos_pose, f_rel_pose, pos_rel_pose, return_attn=False):
         final_output = [(f_state, f_img)]  # before projection
         assert f_state.shape[-1] == self.dec_embed_dim
         f_img = self.decoder_embed(f_img)
@@ -710,41 +713,36 @@ class ARCroco3DStereo(CroCoNet):
             assert f_pose is not None and pos_pose is not None
             if f_rel_pose is not None and pos_rel_pose is not None:
                 # Record token counts before concatenation
-                n_pose = f_pose.shape[1]  # 1
-                n_img = f_img.shape[1]  # number of image tokens after decoder_embed
-                n_rel_pose = f_rel_pose.shape[1]  # num_prompt_tokens
-                total_tokens = n_pose + n_img + n_rel_pose
-
-                # Concatenate tokens
-                f_img = torch.cat([f_pose, f_img, f_rel_pose], dim=1)
-                pos_img = torch.cat([pos_pose, pos_img, pos_rel_pose], dim=1)
-
-                # Construct masks only if use_mask_attention is enabled
-                if self.use_mask_attention:
-                    # Record token counts before concatenation
                     n_pose = f_pose.shape[1]  # 1
-                    n_img = n_img  # number of image tokens after decoder_embed
+                    n_img = f_img.shape[1]  # number of image tokens after decoder_embed
                     n_rel_pose = f_rel_pose.shape[1]  # num_prompt_tokens
                     total_tokens = n_pose + n_img + n_rel_pose
 
-                    # Self-attention mask for blk_img: [pose, img] cannot attend to rel_pose
-                    # Shape: (total_tokens, total_tokens), True = allow, False = block
-                    img_self_attn_mask = torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=f_img.device)
-                    # Block: pose and img cannot attend to rel_pose
-                    img_self_attn_mask[:n_pose + n_img, n_pose + n_img:] = False
-                    # Note: rel_pose can attend to everything (including self-attention among rel_pose)
+                    # Concatenate tokens
+                    f_img = torch.cat([f_pose, f_img, f_rel_pose], dim=1)
+                    pos_img = torch.cat([pos_pose, pos_img, pos_rel_pose], dim=1)
 
-                    # Cross-attention mask for blk_state: state cannot attend to rel_pose in f_img
-                    # Shape: (n_state, total_tokens)
-                    n_state = f_state.shape[1]
-                    state_cross_attn_mask = torch.ones(n_state, total_tokens, dtype=torch.bool, device=f_state.device)
-                    # Block: state cannot attend to rel_pose
-                    state_cross_attn_mask[:, n_pose + n_img:] = False
+                    # Construct masks only if use_mask_attention is enabled
+                    if self.use_mask_attention:
+                        # Self-attention mask for blk_img: [pose, img] cannot attend to rel_pose
+                        # Shape: (total_tokens, total_tokens), True = allow, False = block
+                        img_self_attn_mask = torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=f_img.device)
+                        # Block: pose and img cannot attend to rel_pose
+                        img_self_attn_mask[:n_pose + n_img, n_pose + n_img:] = False
+                        # Note: rel_pose can attend to everything (including self-attention among rel_pose)
+
+                        # Cross-attention mask for blk_state: state cannot attend to rel_pose in f_img
+                        # Shape: (n_state, total_tokens)
+                        n_state = f_state.shape[1]
+                        state_cross_attn_mask = torch.ones(n_state, total_tokens, dtype=torch.bool, device=f_state.device)
+                        # Block: state cannot attend to rel_pose
+                        state_cross_attn_mask[:, n_pose + n_img:] = False
             else:
                 f_img = torch.cat([f_pose, f_img], dim=1)
                 pos_img = torch.cat([pos_pose, pos_img], dim=1)
 
         final_output.append((f_state, f_img))
+        attention_maps = []  # Store attention maps for TTT3R
         for blk_state, blk_img in zip(self.dec_blocks_state, self.dec_blocks):
             if (
                 self.gradient_checkpointing
@@ -752,46 +750,52 @@ class ARCroco3DStereo(CroCoNet):
                 and torch.is_grad_enabled()
             ):
                 # Pass masks as positional arguments for gradient checkpointing compatibility
-                f_state, _ = checkpoint(
+                f_state, _, self_attn_state, cross_attn_state = checkpoint(
                     blk_state,
                     *final_output[-1][::+1],
                     pos_state,
                     pos_img,
                     None,  # self_attn_mask: state self-attention no need to mask
                     state_cross_attn_mask,  # cross_attn_mask
+                    return_attn,  # return_attn
                     use_reentrant=not self.fixed_input_length,
                 )
-                f_img, _ = checkpoint(
+                f_img, _, self_attn_img, cross_attn_img = checkpoint(
                     blk_img,
                     *final_output[-1][::-1],
                     pos_img,
                     pos_state,
                     img_self_attn_mask,  # self_attn_mask
                     None,  # cross_attn_mask: f_img cross-attend to f_state, no need to mask
+                    return_attn,  # return_attn
                     use_reentrant=not self.fixed_input_length,
                 )
+                attention_maps.append((self_attn_state, cross_attn_state, self_attn_img, cross_attn_img))
             else:
-                f_state, _ = blk_state(
+                f_state, _, self_attn_state, cross_attn_state = blk_state(
                     *final_output[-1][::+1],
                     pos_state,
                     pos_img,
                     self_attn_mask=None,  # state self-attention no need to mask
-                    cross_attn_mask=state_cross_attn_mask
+                    cross_attn_mask=state_cross_attn_mask,
+                    return_attn=return_attn
                 )
-                f_img, _ = blk_img(
+                f_img, _, self_attn_img, cross_attn_img = blk_img(
                     *final_output[-1][::-1],
                     pos_img,
                     pos_state,
                     self_attn_mask=img_self_attn_mask,
-                    cross_attn_mask=None  # f_img cross-attend to f_state, no need to mask
+                    cross_attn_mask=None,  # f_img cross-attend to f_state, no need to mask
+                    return_attn=return_attn
                 )
+                attention_maps.append((self_attn_state, cross_attn_state, self_attn_img, cross_attn_img))
             final_output.append((f_state, f_img))
         del final_output[1]  # duplicate with final_output[0]
         final_output[-1] = (
             self.dec_norm_state(final_output[-1][0]),
             self.dec_norm(final_output[-1][1]),
         )
-        return zip(*final_output)
+        return zip(*final_output), zip(*attention_maps)
 
     def _downstream_head(self, decout, img_shape, **kwargs):
         B, S, D = decout[-1].shape
@@ -820,12 +824,13 @@ class ARCroco3DStereo(CroCoNet):
         img_mask=None,
         reset_mask=None,
         update=None,
+        return_attn=False,
     ):
-        new_state_feat, dec = self._decoder(
-            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos, rel_pose_feat, rel_pose_pos
+        (new_state_feat, dec), (self_attn_state, cross_attn_state, self_attn_img, cross_attn_img) = self._decoder(
+            state_feat, state_pos, current_feat, current_pos, pose_feat, pose_pos, rel_pose_feat, rel_pose_pos, return_attn=return_attn
         )
         new_state_feat = new_state_feat[-1]
-        return new_state_feat, dec
+        return new_state_feat, dec, self_attn_state, cross_attn_state, self_attn_img, cross_attn_img
 
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
@@ -879,7 +884,7 @@ class ARCroco3DStereo(CroCoNet):
             rel_pose_pos_i = None
             n_prompt_tokens = 0
         
-        new_state_feat, dec = self._recurrent_rollout(
+        new_state_feat, dec, _, _, _, _ = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -892,6 +897,7 @@ class ARCroco3DStereo(CroCoNet):
             img_mask=views[i]["img_mask"],
             reset_mask=views[i]["reset"],
             update=views[i].get("update", None),
+            return_attn=False,
         )
         out_pose_feat_i = dec[-1][:, 0:1]
         new_mem = self.pose_retriever.update_mem(
@@ -899,13 +905,13 @@ class ARCroco3DStereo(CroCoNet):
         )
 
         if n_prompt_tokens > 0:
-            head_input = [
-                dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth][:, :-n_prompt_tokens].float(),
-            ]
-            rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                ]
+                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
         else:
             head_input = [
                 dec[0].float(),
@@ -914,7 +920,19 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth].float(),
             ]
             rel_pose_token = None
-        res = self._downstream_head(head_input, shape_i, pos=pos_i, rel_pose_token=rel_pose_token)
+
+        # Extract current pose_token for temporal conditioning
+        # head_input[-1] is the last decoder layer output
+        # pose_token is the first token (index 0)
+        current_pose_token = head_input[-1][:, 0].clone().float()  # (B, hidden_size)
+
+        res = self._downstream_head(
+            head_input,
+            shape_i,
+            pos=pos_i,
+            rel_pose_token=rel_pose_token,
+            prev_pose_token=self.prev_pose_token  # Pass stored prev token
+        )
 
         if res.get("relative_pose") is not None and i > 0:
             T_rel = res.get("relative_pose")
@@ -940,6 +958,24 @@ class ARCroco3DStereo(CroCoNet):
             reset_mask = reset_mask[:, None, None].float()
             state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
+            # Reset prev_pose_token on sequence boundary
+            if self.prev_pose_token is not None:
+                self.prev_pose_token = None
+
+        # Update prev_pose_token for next frame (detached for no gradient backprop)
+        if img_mask.any():  # Only update if frame is valid
+            if self.prev_pose_token is None:
+                # First valid frame: initialize
+                self.prev_pose_token = current_pose_token.detach()
+            else:
+                # Update conditionally with update_mask
+                # update_mask shape: (B, 1, 1), need (B,) for broadcasting
+                update_mask_1d = update_mask[:, 0, 0]  # (B,)
+                self.prev_pose_token = (
+                    current_pose_token.detach() * update_mask_1d.unsqueeze(1) +
+                    self.prev_pose_token * (1 - update_mask_1d.unsqueeze(1))
+                )
+
         return res, (state_feat, mem)
 
     def _forward_impl(self, views, ret_state=False):
@@ -951,6 +987,13 @@ class ARCroco3DStereo(CroCoNet):
         init_mem = mem.clone()
         all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
         ress = []
+        self.prev_pose_token = None  # Reset previous pose token at sequence start
+
+        # Determine if we need attention maps for TTT3R
+        # Use getattr for compatibility with CrocoConfig which may not have model_update_type
+        model_update_type = getattr(self.config, 'model_update_type', 'cut3r')
+        use_ttt3r = model_update_type == "ttt3r"
+
         for i in range(len(views)):
             feat_i = feat[i]
             pos_i = pos[i]
@@ -975,8 +1018,11 @@ class ARCroco3DStereo(CroCoNet):
                 rel_pose_feat_i = None
                 rel_pose_pos_i = None
                 n_prompt_tokens = 0
-            
-            new_state_feat, dec = self._recurrent_rollout(
+
+            # For TTT3R, we need attention maps only for frames after the first
+            return_attn = use_ttt3r and (i > 0)
+
+            new_state_feat, dec, self_attn_state, cross_attn_state, self_attn_img, cross_attn_img = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -989,6 +1035,7 @@ class ARCroco3DStereo(CroCoNet):
                 img_mask=views[i]["img_mask"],
                 reset_mask=views[i]["reset"],
                 update=views[i].get("update", None),
+                return_attn=return_attn,
             )
             out_pose_feat_i = dec[-1][:, 0:1]
             new_mem = self.pose_retriever.update_mem(
@@ -1020,7 +1067,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.prev_T_c2w = current_T_c2w
             elif i == 0:
                 self.prev_T_c2w = torch.eye(4, device=res["camera_pose"].device, dtype=res["camera_pose"].dtype).unsqueeze(0).expand(res["camera_pose"].shape[0], -1, -1)
-            
+
             ress.append(res)
             img_mask = views[i]["img_mask"]
             update = views[i].get("update", None)
@@ -1031,12 +1078,45 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
+
+            # TTT3R adaptive state update
+            if i == 0:
+                # First frame: always full update
+                update_mask_state = update_mask
+            else:
+                if model_update_type == "cut3r":
+                    # CUT3R: always full update
+                    update_mask_state = update_mask
+                elif model_update_type == "ttt3r":
+                    # TTT3R: adaptive update based on cross-attention confidence
+                    # cross_attn_state is a tuple of attention maps from each decoder layer
+                    # Each attention map has shape [B, num_heads, n_state, n_img_tokens]
+                    cross_attn_state_list = list(cross_attn_state)
+                    # Filter out None values (from gradient checkpointing)
+                    cross_attn_state_list = [x for x in cross_attn_state_list if x is not None]
+                    if len(cross_attn_state_list) > 0:
+                        # Stack attention maps: [num_layers, B, num_heads, n_state, n_img]
+                        cross_attn_tensor = torch.stack(cross_attn_state_list, dim=0)
+                        # Rearrange to [B, n_state, n_img, num_layers * num_heads]
+                        cross_attn_tensor = rearrange(cross_attn_tensor, 'l b h nstate nimg -> b nstate nimg (l h)')
+                        # Average attention across all dimensions to get confidence per sample
+                        state_query_img_key = cross_attn_tensor.mean(dim=(-1, -2))  # [B, n_state]
+                        # Apply sigmoid to get update weight per token
+                        update_weight = torch.sigmoid(state_query_img_key)  # [B, n_state]
+                        # Scale update mask by attention confidence
+                        update_mask_state = update_mask * update_weight[:, :, None]
+                    else:
+                        # Fallback to full update if no attention maps available
+                        update_mask_state = update_mask
+                else:
+                    raise ValueError(f"Invalid model_update_type: {model_update_type}")
+
+            state_feat = new_state_feat * update_mask_state + state_feat * (
+                1 - update_mask_state
             )  # update global state
             mem = new_mem * update_mask + mem * (
                 1 - update_mask
-            )  # then update local state
+            )  # then update local state (always full update for mem)
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
@@ -1102,7 +1182,7 @@ class ARCroco3DStereo(CroCoNet):
             rel_pose_pos_i = None
             n_prompt_tokens = 0
         
-        new_state_feat, dec = self._recurrent_rollout(
+        new_state_feat, dec, _, _, _, _ = self._recurrent_rollout(
             state_feat,
             state_pos,
             feat_i,
@@ -1115,6 +1195,7 @@ class ARCroco3DStereo(CroCoNet):
             img_mask=view["img_mask"],
             reset_mask=view["reset"],
             update=view.get("update", None),
+            return_attn=False,
         )
 
         out_pose_feat_i = dec[-1][:, 0:1]
@@ -1123,13 +1204,13 @@ class ARCroco3DStereo(CroCoNet):
         )
         assert len(dec) == self.dec_depth + 1
         if n_prompt_tokens > 0:
-            head_input = [
-                dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth][:, :-n_prompt_tokens].float(),
-            ]
-            rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+                head_input = [
+                    dec[0].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                ]
+                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
         else:
             head_input = [
                 dec[0].float(),
@@ -1252,7 +1333,13 @@ class ARCroco3DStereo(CroCoNet):
                 rel_pose_pos_i = None
                 n_prompt_tokens = 0
                 
-            new_state_feat, dec = self._recurrent_rollout(
+            # For TTT3R, we need attention maps only for frames after the first
+            # Use getattr for compatibility with CrocoConfig which may not have model_update_type
+            model_update_type = getattr(self.config, 'model_update_type', 'cut3r')
+            use_ttt3r = model_update_type == "ttt3r"
+            return_attn = use_ttt3r and (i > 0)
+
+            new_state_feat, dec, self_attn_state, cross_attn_state, self_attn_img, cross_attn_img = self._recurrent_rollout(
                 state_feat,
                 state_pos,
                 feat_i,
@@ -1265,22 +1352,23 @@ class ARCroco3DStereo(CroCoNet):
                 img_mask=view["img_mask"],
                 reset_mask=view["reset"],
                 update=view.get("update", None),
+                return_attn=return_attn,
             )
-            
+
             out_pose_feat_i = dec[-1][:, 0:1]
             new_mem = self.pose_retriever.update_mem(
                 mem, global_img_feat_i, out_pose_feat_i
             )
-            
+
             assert len(dec) == self.dec_depth + 1
             if n_prompt_tokens > 0:
-                head_input = [
-                    dec[0].float(),
-                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
-                ]
-                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+                    head_input = [
+                        dec[0].float(),
+                        dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
+                        dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
+                        dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                    ]
+                    rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
             else:
                 head_input = [
                     dec[0].float(),
@@ -1289,9 +1377,9 @@ class ARCroco3DStereo(CroCoNet):
                     dec[self.dec_depth].float(),
                 ]
                 rel_pose_token = None
-            
+
             res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token)
-            
+
             # Move result to CPU immediately to save GPU memory
             res_cpu = {}
             for key, value in res.items():
@@ -1300,7 +1388,7 @@ class ARCroco3DStereo(CroCoNet):
                 else:
                     res_cpu[key] = value
             ress.append(res_cpu)
-            
+
             # Create minimal processed view (keep only essential data on CPU)
             processed_view = {
                 "img": view["img"].cpu(),
@@ -1308,16 +1396,40 @@ class ARCroco3DStereo(CroCoNet):
                 "instance": view.get("instance", str(i)),
             }
             processed_views.append(processed_view)
-            
+
             img_mask = view["img_mask"]
             update = view.get("update", None)
             if update is not None:
                 update_mask = img_mask & update
             else:
                 update_mask = img_mask
-                
+
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (1 - update_mask)
+
+            # TTT3R adaptive state update
+            if i == 0:
+                # First frame: always full update
+                update_mask_state = update_mask
+            else:
+                if model_update_type == "cut3r":
+                    # CUT3R: always full update
+                    update_mask_state = update_mask
+                elif model_update_type == "ttt3r":
+                    # TTT3R: adaptive update based on cross-attention confidence
+                    cross_attn_state_list = list(cross_attn_state)
+                    cross_attn_state_list = [x for x in cross_attn_state_list if x is not None]
+                    if len(cross_attn_state_list) > 0:
+                        cross_attn_tensor = torch.stack(cross_attn_state_list, dim=0)
+                        cross_attn_tensor = rearrange(cross_attn_tensor, 'l b h nstate nimg -> b nstate nimg (l h)')
+                        state_query_img_key = cross_attn_tensor.mean(dim=(-1, -2))
+                        update_weight = torch.sigmoid(state_query_img_key)
+                        update_mask_state = update_mask * update_weight[:, :, None]
+                    else:
+                        update_mask_state = update_mask
+                else:
+                    raise ValueError(f"Invalid model_update_type: {model_update_type}")
+
+            state_feat = new_state_feat * update_mask_state + state_feat * (1 - update_mask_state)
             mem = new_mem * update_mask + mem * (1 - update_mask)
             
             reset_mask = view["reset"]

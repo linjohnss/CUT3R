@@ -344,8 +344,12 @@ class DPTPts3dPoseWithRelativePose(nn.Module):
             with torch.cuda.amp.autocast(enabled=False):
                 pose = self.pose_head(pose_token)
                 rel_pose_token = kwargs.get("rel_pose_token")
+                prev_pose_token = kwargs.get("prev_pose_token")  # Get prev_pose_token (B, hidden_size)
                 if rel_pose_token is not None:
-                    relative_pose = self.relative_pose_head(rel_pose_token)
+                    relative_pose = self.relative_pose_head(
+                        rel_pose_token,          # (B, num_tokens, hidden_size)
+                        prev_pose_token=prev_pose_token  # (B, hidden_size)
+                    )
                 else:
                     relative_pose = None
             token_cross = token.clone()
