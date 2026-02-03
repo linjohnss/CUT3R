@@ -12,14 +12,14 @@ n_corres_test: 0
 
 # Loss configuration
 # Available switches in ConfLoss:
-#   use_pts_loss: Confidence-weighted point cloud loss (default: False)
+#   use_pts_loss: Confidence-weighted point cloud loss (default: True)
 #   use_pose_loss: Absolute camera pose loss (default: False)
-#   use_relative_pose_loss: Relative pose token loss (default: False)
-#   use_geo_loss: Geometric consistency loss using GT points (default: True)
-#   use_scale_loss: Scale consistency loss (default: False)
+#   use_relative_pose_loss: Relative pose token loss (default: True)
+#   rot_loss_weight: Weight for rotation loss (default: 10.0, increase if rotation is not learning well)
+#   trans_loss_weight: Weight for translation loss (default: 1.0, increase for small-scale datasets like TartanAir)
 # Disabled losses are NOT computed, improving training speed
-train_criterion: ConfLoss(Regr3DPoseBatchList(L21, norm_mode='?avg_dis', use_pts_loss=True, use_pose_loss=True, use_relative_pose_loss=True, use_geo_loss=False, use_scale_loss=False), alpha=0.2)
-test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0) + Regr3DPose_ScaleInv(L21, norm_mode='?avg_dis', gt_scale=True, sky_loss_value=0)
+train_criterion: ConfLoss(Regr3DPoseBatchList(L21, norm_mode='?avg_dis', use_pts_loss=True, use_pose_loss=True, use_relative_pose_loss=True, use_accumulated_pose_loss=False, rot_loss_weight=1.0, trans_loss_weight=1.0, use_align_scale=False), alpha=0.2)
+test_criterion: Regr3DPose(L21, norm_mode='?avg_dis', gt_scale=False, sky_loss_value=0) + Regr3DPose_ScaleInv(L21, norm_mode='?avg_dis', gt_scale=False, sky_loss_value=0)
 
 resolution: [(512, 384), (512, 336), (512, 288), (512, 256), (512, 208), (512, 144), (384, 512), (336, 512), (288, 512), (256, 512)]
 
@@ -68,8 +68,8 @@ train_dataset: 4000 @ ${dataset14}
 test_dataset: 1000 @ TartanAir_Multi(split=None, ROOT='../../dataset/mast3r_data/processed_tartanair', resolution=(512, 288), num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
 seed: 0
-batch_size: 1
-accum_iter: 4
+batch_size: 8
+accum_iter: 1
 gradient_checkpointing: true
 epochs: 40
 start_epoch: 0
@@ -79,7 +79,7 @@ min_lr: 1.0e-06
 warmup_epochs: 5
 amp: 1
 
-num_workers: 8
+num_workers: 16
 world_size: 1
 local-rank: -1
 dist_url: 'env://'
@@ -95,7 +95,7 @@ print_freq: 100
 print_img_freq: 300
 num_imgs_vis: 4
 save_dir: 'checkpoints'
-exp_name: 'prompt3r_test'
+exp_name: 'prompt3r'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

@@ -27,19 +27,21 @@ Example:
         --seq_path examples/vkitti_scene01 --device cuda --no_relative_pose
 """
 
+import argparse
+import glob
 import os
+import random
+import shutil
+import tempfile
+import time
+from copy import deepcopy
+
+import cv2
+import imageio.v2 as iio
 import numpy as np
 import torch
-import time
-import glob
-import random
-import cv2
-import argparse
-import tempfile
-import shutil
-from copy import deepcopy
+
 from add_ckpt_path import add_path_to_dust3r
-import imageio.v2 as iio
 
 # Set random seed for reproducibility.
 random.seed(42)
@@ -113,7 +115,7 @@ def parse_args():
         type=int,
         default=1,
         help="Update interval for state update (default: 1, update every frame). "
-             "Note: relative_pose is predicted relative to the previous updated frame.",
+        "Note: relative_pose is predicted relative to the previous updated frame.",
     )
     parser.add_argument(
         "--max_frame",
@@ -121,13 +123,26 @@ def parse_args():
         default=None,
         help="Maximum number of frames to process (default: None, process all frames).",
     )
+    parser.add_argument(
+        "--reset_interval",
+        type=int,
+        default=1000000,
+        help="Only used for demo, reset state for extremely long sequence, chunks are aligned via global camera poses",
+    )
 
     return parser.parse_args()
 
 
 def prepare_input(
-    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True,
-    update_interval=1
+    img_paths,
+    img_mask,
+    size,
+    raymaps=None,
+    raymap_mask=None,
+    revisit=1,
+    update=True,
+    update_interval=1,
+    reset_interval=1000000,
 ):
     """
     Prepare input views for inference from a list of image paths.
@@ -177,9 +192,13 @@ def prepare_input(
                 "img_mask": torch.tensor(True).unsqueeze(0),
                 "ray_mask": torch.tensor(False).unsqueeze(0),
                 "update": torch.tensor(should_update).unsqueeze(0),
-                "reset": torch.tensor(False).unsqueeze(0),
+                "reset": torch.tensor((i + 1) % reset_interval == 0).unsqueeze(0),
             }
             views.append(view)
+            if (i + 1) % reset_interval == 0:
+                overlap_view = deepcopy(view)
+                overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
+                views.append(overlap_view)
     else:
         # Combine images and raymaps.
         num_views = len(images) + len(raymaps)
@@ -213,13 +232,17 @@ def prepare_input(
                 "img_mask": torch.tensor(img_mask[i]).unsqueeze(0),
                 "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0),
                 "update": torch.tensor(img_mask[i]).unsqueeze(0),
-                "reset": torch.tensor(False).unsqueeze(0),
+                "reset": torch.tensor((i + 1) % reset_interval == 0).unsqueeze(0),
             }
             if img_mask[i]:
                 j += 1
             if raymap_mask[i]:
                 k += 1
             views.append(view)
+            if (i + 1) % reset_interval == 0:
+                overlap_view = deepcopy(view)
+                overlap_view["reset"] = torch.tensor(False).unsqueeze(0)
+                views.append(overlap_view)
         assert j == len(images) and k == len(raymaps)
 
     if revisit > 1:
@@ -237,8 +260,9 @@ def prepare_input(
     return views
 
 
-def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None,
-                   update_interval=1):
+def prepare_output(
+    outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None, update_interval=1
+):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
@@ -256,14 +280,34 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
     """
-    from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
-    from src.dust3r.utils.geometry import geotrf
+    from src.dust3r.utils.camera import pose_encoding_to_camera
+    from src.dust3r.utils.geometry import geotrf, matrix_cumprod
 
     # Only keep the outputs corresponding to one full pass.
     valid_length = len(outputs["pred"]) // revisit
     outputs["pred"] = outputs["pred"][-valid_length:]
     outputs["views"] = outputs["views"][-valid_length:]
+
+    # Handle reset frames: delete overlap frames (reset_mask=True followed by reset_mask=False)
+    # Check if reset key exists in views (it may not be preserved by inference)
+    has_reset_key = len(outputs["views"]) > 0 and "reset" in outputs["views"][0]
+    if has_reset_key:
+        reset_mask = torch.cat([view["reset"] for view in outputs["views"]], 0)
+        shifted_reset_mask = torch.cat(
+            [torch.tensor(False).unsqueeze(0), reset_mask[:-1]], dim=0
+        )
+
+        outputs["pred"] = [
+            pred for pred, mask in zip(outputs["pred"], shifted_reset_mask) if not mask
+        ]
+        outputs["views"] = [
+            view for view, mask in zip(outputs["views"], shifted_reset_mask) if not mask
+        ]
+        reset_mask = reset_mask[~shifted_reset_mask]
+    else:
+        # No reset info available, assume no resets
+        reset_mask = torch.zeros(len(outputs["views"]), dtype=torch.bool)
 
     pts3ds_self_ls = [output["pts3d_in_self_view"].cpu() for output in outputs["pred"]]
     pts3ds_other = [output["pts3d_in_other_view"].cpu() for output in outputs["pred"]]
@@ -274,17 +318,31 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
     # Determine pose accumulation method
     if use_relative_pose is None:
         # Auto-detect: check if relative_pose is available in predictions
-        use_relative_pose = any("relative_pose" in pred and pred.get("relative_pose") is not None for pred in outputs["pred"])
+        use_relative_pose = any(
+            "relative_pose" in pred and pred.get("relative_pose") is not None
+            for pred in outputs["pred"]
+        )
     elif use_relative_pose:
         # User explicitly requested relative pose, check if available
-        has_relative_pose = any("relative_pose" in pred and pred.get("relative_pose") is not None for pred in outputs["pred"])
+        has_relative_pose = any(
+            "relative_pose" in pred and pred.get("relative_pose") is not None
+            for pred in outputs["pred"]
+        )
         if not has_relative_pose:
-            print("Warning: --use_relative_pose specified but relative_pose not found in model output. Falling back to camera_pose.")
+            print(
+                "Warning: --use_relative_pose specified but relative_pose not found in model output. Falling back to camera_pose."
+            )
             use_relative_pose = False
 
     if use_relative_pose:
         # Accumulate camera poses from relative_pose (4x4 matrix multiplication)
         # Note: relative_pose is predicted relative to the previous UPDATED frame
+        #
+        # Reset interval logic:
+        # - Frame i with reset=True: relative_pose is still valid (computed before state reset)
+        # - Overlap frame (i') is removed from output
+        # - Frame i+1's relative_pose is relative to overlap frame = same image as frame i
+        # - So accumulation is naturally continuous, no special handling needed
         pr_poses = []
         prev_updated_T_c2w = None  # Pose of the last updated frame
         curr_T_c2w = None  # Current accumulated pose
@@ -296,7 +354,9 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
             if i == 0:
                 # First frame: use identity matrix (world frame origin)
                 B = pred["pts3d_in_self_view"].shape[0]
-                curr_T_c2w = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
+                curr_T_c2w = (
+                    torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
+                )
                 prev_updated_T_c2w = curr_T_c2w.clone()
             else:
                 # Subsequent frames: accumulate from relative_pose
@@ -318,14 +378,35 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
             pr_poses.append(curr_T_c2w.clone())
 
         # Count how many frames were update frames
-        num_update_frames = sum(1 for i in range(len(outputs["pred"])) if i == 0 or i % update_interval == 0)
-        print(f"Using accumulated camera poses from relative_pose ({len(pr_poses)} frames, {num_update_frames} update frames)")
+        num_update_frames = sum(
+            1 for i in range(len(outputs["pred"])) if i == 0 or i % update_interval == 0
+        )
+        num_reset_frames = reset_mask.sum().item() if reset_mask.any() else 0
+        print(
+            f"Using accumulated camera poses from relative_pose ({len(pr_poses)} frames, {num_update_frames} update frames, {num_reset_frames} resets)"
+        )
     else:
         # Use direct camera_pose
         pr_poses = [
             pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
             for pred in outputs["pred"]
         ]
+
+        # Handle reset: accumulate poses across reset boundaries using global camera poses
+        if reset_mask.any():
+            pr_poses = torch.cat(pr_poses, 0)
+            identity = torch.eye(4, device=pr_poses.device)
+            reset_poses = torch.where(
+                reset_mask.unsqueeze(-1).unsqueeze(-1), pr_poses, identity
+            )
+            cumulative_bases = matrix_cumprod(reset_poses)
+            shifted_bases = torch.cat(
+                [identity.unsqueeze(0), cumulative_bases[:-1]], dim=0
+            )
+            pr_poses = torch.einsum("bij,bjk->bik", shifted_bases, pr_poses)
+            # Convert back to list format
+            pr_poses = list(pr_poses.unsqueeze(1).unbind(0))
+
         print(f"Using direct camera_pose ({len(pr_poses)} frames)")
     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
     t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
@@ -401,7 +482,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_relative_pose=
 def parse_seq_path(p, frame_interval=1):
     if os.path.isdir(p):
         # Only get image files (common image extensions)
-        img_extensions = ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']
+        img_extensions = ["*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG"]
         img_paths = []
         for ext in img_extensions:
             img_paths.extend(glob.glob(f"{p}/{ext}"))
@@ -465,7 +546,7 @@ def run_inference(args):
 
     # Apply max_frame limit if specified
     if args.max_frame is not None and args.max_frame > 0:
-        img_paths = img_paths[:args.max_frame]
+        img_paths = img_paths[: args.max_frame]
         print(f"Limited to {len(img_paths)} frames (max_frame={args.max_frame}).")
     else:
         print(f"Found {len(img_paths)} images in {args.seq_path}.")
@@ -480,6 +561,7 @@ def run_inference(args):
         revisit=1,
         update=True,
         update_interval=args.update_interval,
+        reset_interval=args.reset_interval,
     )
     if tmpdirname is not None:
         shutil.rmtree(tmpdirname)
@@ -503,7 +585,9 @@ def run_inference(args):
     print("Preparing output for visualization...")
     # Determine pose accumulation mode based on command-line arguments
     if args.use_relative_pose and args.no_relative_pose:
-        print("Warning: Both --use_relative_pose and --no_relative_pose specified. --no_relative_pose takes precedence.")
+        print(
+            "Warning: Both --use_relative_pose and --no_relative_pose specified. --no_relative_pose takes precedence."
+        )
         use_relative_pose = False
     elif args.use_relative_pose:
         use_relative_pose = True
@@ -513,8 +597,12 @@ def run_inference(args):
         use_relative_pose = None  # Auto-detect
 
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True, use_relative_pose=use_relative_pose,
-        update_interval=args.update_interval
+        outputs,
+        args.output_dir,
+        1,
+        True,
+        use_relative_pose=use_relative_pose,
+        update_interval=args.update_interval,
     )
 
     # Convert tensors to numpy arrays for visualization.
@@ -536,7 +624,7 @@ def run_inference(args):
         show_camera=True,
         vis_threshold=args.vis_threshold,
         size=args.size,
-        downsample_factor=args.downsample_factor
+        downsample_factor=args.downsample_factor,
     )
     viewer.run()
 
