@@ -44,103 +44,40 @@ class PoseDecoder(nn.Module):
 
 
 class RelativePoseDecoder(nn.Module):
+    """
+    RelativePoseDecoder with per-token independent decoding.
+
+    Architecture:
+    Each prompt token independently predicts a relative pose via shared MLP.
+    Token k predicts T(frame_i -> frame_{i-k-1}), forming sliding window constraints.
+
+    Output: (B, N, 4, 4) SE(3) matrices + (B, N) valid mask
+    """
     def __init__(
         self,
         hidden_size=768,
         mlp_ratio=4,
-        pose_encoding_type="absT_rot9d",
-        num_prompt_tokens=8,
-        num_attn_heads=8,
+        pose_encoding_type="absT_rot6d",
+        num_prompt_tokens=16,
+        num_attn_heads=8,  # Kept for backward compatibility but not used
     ):
         super().__init__()
 
         self.pose_encoding_type = pose_encoding_type
         self.hidden_size = hidden_size
         self.num_prompt_tokens = num_prompt_tokens
-        self.num_attn_heads = num_attn_heads
 
         # =====================================================================
-        # Cross-Attention to Previous Pose Token
+        # Shared MLP for per-token decoding
+        # Input: each token (B*N, hidden_size)
+        # Output: 9D (3D translation + 6D rotation) per token
         # =====================================================================
-        # Prompt tokens (query) attend to previous pose token (key/value)
-        # This conditions current predictions on previous frame's context
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_attn_heads,
-            batch_first=True,
-            dropout=0.0,
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=int(hidden_size * mlp_ratio),
+            out_features=9,  # 3 for trans, 6 for rot (6D representation)
+            drop=0,
         )
-        self.norm_cross_q = nn.LayerNorm(hidden_size)
-        self.norm_cross_kv = nn.LayerNorm(hidden_size)
-
-        # =====================================================================
-        # Attention Pooling: Learnable queries for translation and rotation
-        # =====================================================================
-        # These queries learn to "ask" the prompt tokens for relevant information
-        # Translation query: learns to focus on tokens encoding displacement info
-        # Rotation query: learns to focus on tokens encoding orientation info
-        self.trans_query = nn.Parameter(
-            torch.randn(1, 1, hidden_size) * 0.02
-        )
-        self.rot_query = nn.Parameter(
-            torch.randn(1, 1, hidden_size) * 0.02
-        )
-
-        # Multi-head cross-attention for pooling
-        # Query: learnable query (1 token)
-        # Key/Value: prompt tokens (num_prompt_tokens tokens)
-        self.trans_attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_attn_heads,
-            batch_first=True,
-            dropout=0.0,
-        )
-        self.rot_attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_attn_heads,
-            batch_first=True,
-            dropout=0.0,
-        )
-
-        # Layer norms for attention pooling
-        self.norm_trans_q = nn.LayerNorm(hidden_size)
-        self.norm_rot_q = nn.LayerNorm(hidden_size)
-        self.norm_pool_kv = nn.LayerNorm(hidden_size)
-
-        # =====================================================================
-        # MLP for processing attention-pooled features
-        # =====================================================================
-        output_dim = int(hidden_size * mlp_ratio)
-
-        # Separate MLPs for translation and rotation pathways
-        self.trans_mlp = nn.Sequential(
-            nn.Linear(hidden_size, output_dim),
-            nn.GELU(),
-            nn.Linear(output_dim, output_dim),
-            nn.GELU(),
-        )
-        self.rot_mlp = nn.Sequential(
-            nn.Linear(hidden_size, output_dim),
-            nn.GELU(),
-            nn.Linear(output_dim, output_dim),
-            nn.GELU(),
-        )
-
-        # =====================================================================
-        # Output heads for translation and rotation
-        # =====================================================================
-        self.fc_t = nn.Linear(output_dim, 3)  # Translation head: 3D vector
-        self.fc_rot = nn.Linear(output_dim, 6)  # Rotation head: 6D representation (2 rows of 3)
-
-        # Initialize rotation head to output Identity matrix (first 2 rows)
-        # Identity rotation in 6D: [1, 0, 0, 0, 1, 0]
-        nn.init.zeros_(self.fc_rot.weight)
-        identity_6d = torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float)
-        self.fc_rot.bias.data.copy_(identity_6d)
-
-        # Translation head: zero-initialized for identity transform
-        nn.init.zeros_(self.fc_t.weight)
-        nn.init.zeros_(self.fc_t.bias)
 
     def orthogonalize_rotation(self, R):
         """
@@ -172,107 +109,53 @@ class RelativePoseDecoder(nn.Module):
 
         return R_ortho
 
-    def forward(self, pose_feat, prev_pose_token=None):
+    def forward(self, pose_feat, n_valid_tokens=None):
         """
-        Forward pass to predict relative pose from prompt tokens.
+        Forward pass: per-token independent decoding of relative poses.
 
-        Architecture:
-        1. Cross-attention: prompt tokens attend to previous pose token
-        2. Attention pooling: learnable queries aggregate updated prompt tokens
-        3. MLP processing and pose prediction
+        Each token k predicts T(frame_i -> frame_{i-k-1}) via shared MLP.
 
         Args:
-            pose_feat: (B, num_prompt_tokens, hidden_size) - prompt tokens from decoder
-            prev_pose_token: (B, hidden_size) - previous frame's SINGLE pose token (optional)
+            pose_feat: (B, N, D) - N prompt tokens, each independently decoded
+            n_valid_tokens: int or None - number of valid tokens (token k is valid
+                            only if frame_{i-k-1} exists). If None, all tokens are valid.
 
         Returns:
-            T_rel: (B, 4, 4) relative SE(3) transform
+            T_rel: (B, N, 4, 4) per-token SE(3) transforms
+            valid_mask: (B, N) boolean mask indicating valid predictions
         """
-        B, num_tokens, hidden_dim = pose_feat.shape
-        assert num_tokens == self.num_prompt_tokens, \
-            f"Expected {self.num_prompt_tokens} tokens, got {num_tokens}"
+        if pose_feat.dim() == 2:
+            pose_feat = pose_feat.unsqueeze(1)  # (B, 1, D)
 
-        # =====================================================================
-        # Step 1: Cross-attention to previous pose token
-        # =====================================================================
-        if prev_pose_token is not None:
-            # Normalize inputs
-            q = self.norm_cross_q(pose_feat)  # (B, num_prompt_tokens, hidden_size)
-            kv = self.norm_cross_kv(prev_pose_token.unsqueeze(1))  # (B, 1, hidden_size)
+        B, N, D = pose_feat.shape
 
-            # Cross-attention: prompt tokens attend to previous pose token
-            pose_feat_attended, _ = self.cross_attn(
-                query=q,   # (B, num_prompt_tokens, hidden_size)
-                key=kv,    # (B, 1, hidden_size)
-                value=kv,  # (B, 1, hidden_size)
-            )  # Output: (B, num_prompt_tokens, hidden_size)
+        # Per-token MLP: reshape to (B*N, D), apply shared MLP, reshape back
+        pred = self.mlp(pose_feat.reshape(B * N, D).float()).reshape(B, N, 9)
 
-            # Residual connection
-            pose_feat = pose_feat + pose_feat_attended
+        rel_trans = pred[:, :, :3]       # (B, N, 3)
+        rel_rot_6d = pred[:, :, 3:9]     # (B, N, 6)
 
-        # =====================================================================
-        # Step 2: Attention Pooling - aggregate prompt tokens with learnable queries
-        # =====================================================================
+        # Orthogonalize rotation for each token
+        rel_rot_matrix = self.orthogonalize_rotation(
+            rel_rot_6d.reshape(B * N, 2, 3)
+        ).reshape(B, N, 3, 3)  # (B, N, 3, 3)
 
-        # Normalize key/value (updated prompt tokens)
-        kv = self.norm_pool_kv(pose_feat)  # (B, num_prompt_tokens, hidden_size)
-
-        # Expand queries for batch dimension
-        trans_q = self.trans_query.expand(B, -1, -1)  # (B, 1, hidden_size)
-        rot_q = self.rot_query.expand(B, -1, -1)      # (B, 1, hidden_size)
-
-        # Normalize queries
-        trans_q = self.norm_trans_q(trans_q)
-        rot_q = self.norm_rot_q(rot_q)
-
-        # Cross-attention: learnable queries attend to prompt tokens
-        # Translation attention pooling
-        trans_feat, trans_attn_weights = self.trans_attn(
-            query=trans_q,  # (B, 1, hidden_size)
-            key=kv,         # (B, num_prompt_tokens, hidden_size)
-            value=kv,       # (B, num_prompt_tokens, hidden_size)
-        )  # trans_feat: (B, 1, hidden_size)
-
-        # Rotation attention pooling
-        rot_feat, rot_attn_weights = self.rot_attn(
-            query=rot_q,    # (B, 1, hidden_size)
-            key=kv,         # (B, num_prompt_tokens, hidden_size)
-            value=kv,       # (B, num_prompt_tokens, hidden_size)
-        )  # rot_feat: (B, 1, hidden_size)
-
-        # Squeeze the sequence dimension
-        trans_feat = trans_feat.squeeze(1)  # (B, hidden_size)
-        rot_feat = rot_feat.squeeze(1)      # (B, hidden_size)
-
-        # =====================================================================
-        # MLP processing for translation and rotation
-        # =====================================================================
-        trans_feat = self.trans_mlp(trans_feat)  # (B, output_dim)
-        rot_feat = self.rot_mlp(rot_feat)        # (B, output_dim)
-
-        # =====================================================================
-        # Predict translation and rotation
-        # =====================================================================
-        # Use float32 for pose prediction to avoid numerical issues with bfloat16
-        with torch.cuda.amp.autocast(enabled=False):
-            rel_trans = self.fc_t(trans_feat.float())     # (B, 3)
-            rel_rot_6d = self.fc_rot(rot_feat.float())    # (B, 6)
-
-        # Reshape to 2x3 matrix (first two rows) and orthogonalize
-        rel_rot_matrix = rel_rot_6d.reshape(-1, 2, 3)  # (B, 2, 3)
-        rel_rot_matrix = self.orthogonalize_rotation(rel_rot_matrix)  # (B, 3, 3)
-
-        # =====================================================================
-        # Construct SE(3) transformation matrix
-        # =====================================================================
+        # Construct SE(3) transformation matrices
         device = rel_trans.device
         dtype = rel_trans.dtype
-        T_rel = torch.zeros((B, 4, 4), device=device, dtype=dtype)
-        T_rel[:, :3, :3] = rel_rot_matrix
-        T_rel[:, :3, 3] = rel_trans
-        T_rel[:, 3, 3] = 1.0
+        T_rel = torch.zeros((B, N, 4, 4), device=device, dtype=dtype)
+        T_rel[:, :, :3, :3] = rel_rot_matrix
+        T_rel[:, :, :3, 3] = rel_trans
+        T_rel[:, :, 3, 3] = 1.0
 
-        return T_rel
+        # Valid mask: token k is valid only if there are enough previous frames
+        valid_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        if n_valid_tokens is not None:
+            valid_mask[:, :n_valid_tokens] = True
+        else:
+            valid_mask[:] = True
+
+        return T_rel, valid_mask
 
 
 class PoseEncoder(nn.Module):
@@ -682,75 +565,6 @@ def rotate_vector(q, v):
     return v_rot
 
 
-def rotation_matrix_to_9d(R: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 3x3 rotation matrix to 9D vector (flatten).
-    
-    Args:
-        R: (B, 3, 3) rotation matrix
-        
-    Returns:
-        rot_9d: (B, 9) flattened rotation matrix
-    """
-    return R.reshape(*R.shape[:-2], 9)
-
-
-def rotation_9d_to_matrix(rot_9d: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 9D vector to 3x3 rotation matrix (reshape).
-    
-    Args:
-        rot_9d: (B, 9) flattened rotation matrix
-        
-    Returns:
-        R: (B, 3, 3) rotation matrix
-    """
-    return rot_9d.reshape(*rot_9d.shape[:-1], 3, 3)
-
-
-def pose_12d_to_matrix(pose_12d: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 12D pose representation (3 translation + 9D rotation) to 4x4 matrix.
-
-    Args:
-        pose_12d: (..., 12) where last 12 = [tx, ty, tz, rot_9d]
-
-    Returns:
-        T: (..., 4, 4) SE(3) matrix
-    """
-    from dust3r.utils.camera import rotation_9d_to_matrix
-
-    trans = pose_12d[..., :3]
-    rot_9d = pose_12d[..., 3:12]
-    R = rotation_9d_to_matrix(rot_9d)
-
-    T = torch.eye(4, device=pose_12d.device, dtype=pose_12d.dtype)
-    # Broadcast to batch by expanding
-    expand_shape = (*pose_12d.shape[:-1], 4, 4)
-    T = T.expand(expand_shape).clone()
-    T[..., :3, :3] = R
-    T[..., :3, 3] = trans
-    return T
-
-
-def pose_matrix_to_12d(T: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 4x4 pose matrix to 12D representation (3 translation + 9D rotation).
-
-    Args:
-        T: (..., 4, 4) SE(3) matrix
-
-    Returns:
-        pose_12d: (..., 12) where last 12 = [tx, ty, tz, rot_9d]
-    """
-    from dust3r.utils.camera import rotation_matrix_to_9d
-
-    trans = T[..., :3, 3]
-    R = T[..., :3, :3]
-    rot_9d = rotation_matrix_to_9d(R)
-    return torch.cat([trans, rot_9d], dim=-1)
-
-
 def relative_pose_absT_quatR(t1, q1, t2, q2):
     """Compute the relative translation and quaternion between two poses."""
 
@@ -761,3 +575,20 @@ def relative_pose_absT_quatR(t1, q1, t2, q2):
     delta_t = t2 - t1
     t_rel = rotate_vector(q1_inv, delta_t)
     return t_rel, q_rel
+
+
+# =====================================================================
+# Additional utility functions for Prompt3r
+# =====================================================================
+
+def rotation_matrix_to_9d(R: torch.Tensor) -> torch.Tensor:
+    """
+    Convert rotation matrix to 9D representation (flattened 3x3 matrix).
+
+    Args:
+        R: (..., 3, 3) rotation matrices
+
+    Returns:
+        r9d: (..., 9) flattened rotation matrices
+    """
+    return R.flatten(-2)

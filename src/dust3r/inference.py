@@ -129,6 +129,7 @@ def loss_of_one_batch_tbptt(
         shape = [s.detach() for s in shape]
         init_state_feat = init_state_feat.detach()
         init_mem = init_mem.detach()
+        pose_token_buffer = []  # Sliding window buffer across chunks
 
         for chunk_id in range((len(batch) - 1) // chunk_size + 1):
             preds = []
@@ -136,13 +137,14 @@ def loss_of_one_batch_tbptt(
             state_feat = state_feat.detach()
             state_pos = state_pos.detach()
             mem = mem.detach()
+            pose_token_buffer = [t.detach() for t in pose_token_buffer]  # Detach buffer at chunk boundary
             if chunk_id < ((len(batch) - 1) // chunk_size + 1) - 4:
                 with torch.no_grad():
                     for in_chunk_idx in range(chunk_size):
                         i = chunk_id * chunk_size + in_chunk_idx
                         if i >= len(batch):
                             break
-                        res, (state_feat, mem) = accelerator.unwrap_model(
+                        res, (state_feat, mem), pose_token_buffer = accelerator.unwrap_model(
                             model
                         )._forward_decoder_step(
                             batch,
@@ -155,6 +157,7 @@ def loss_of_one_batch_tbptt(
                             state_feat=state_feat,
                             state_pos=state_pos,
                             mem=mem,
+                            pose_token_buffer=pose_token_buffer,
                         )
                         preds.append(res)
                         all_preds.append({k: v.detach() for k, v in res.items()})
@@ -175,7 +178,7 @@ def loss_of_one_batch_tbptt(
                     i = chunk_id * chunk_size + in_chunk_idx
                     if i >= len(batch):
                         break
-                    res, (state_feat, mem) = accelerator.unwrap_model(
+                    res, (state_feat, mem), pose_token_buffer = accelerator.unwrap_model(
                         model
                     )._forward_decoder_step(
                         batch,
@@ -188,6 +191,7 @@ def loss_of_one_batch_tbptt(
                         state_feat=state_feat,
                         state_pos=state_pos,
                         mem=mem,
+                        pose_token_buffer=pose_token_buffer,
                     )
                     preds.append(res)
                     all_preds.append({k: v.detach() for k, v in res.items()})
@@ -257,7 +261,7 @@ def inference_step(view, state_args, model, device, verbose=True):
 
     with torch.cuda.amp.autocast(enabled=False):
         state_feat, state_pos, init_state_feat, mem, init_mem = state_args
-        pred, _ = model.inference_step(
+        pred, _, _ = model.inference_step(
             view, state_feat, state_pos, init_state_feat, mem, init_mem
         )
 

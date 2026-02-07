@@ -319,7 +319,6 @@ class Regr3DPose(Criterion, MultiLoss):
         use_pts_loss=True,
         use_pose_loss=False,
         use_relative_pose_loss=True,
-        use_accumulated_pose_loss=False,
         rot_loss_weight=10.0,
         trans_loss_weight=1.0,
         use_align_scale=False,
@@ -341,7 +340,6 @@ class Regr3DPose(Criterion, MultiLoss):
         self.use_pts_loss = use_pts_loss
         self.use_pose_loss = use_pose_loss
         self.use_relative_pose_loss = use_relative_pose_loss
-        self.use_accumulated_pose_loss = use_accumulated_pose_loss
 
         # Loss weights to balance translation vs rotation
         self.rot_loss_weight = rot_loss_weight
@@ -439,8 +437,10 @@ class Regr3DPose(Criterion, MultiLoss):
             norm_factor_pr[not_metric_mask] = norm_factor_pr_not_metric
         return norm_factor_gt, norm_factor_pr
 
-    def _compute_relative_poses(self, gt_poses, preds, pose_norm_factor_pr, S_flat, eps=1e-3):
-        """Compute GT and aligned predicted relative poses using batch operations.
+    def _compute_relative_poses_window(self, gt_poses, preds, pose_norm_factor_pr, S_flat, eps=1e-3):
+        """Compute GT and aligned predicted relative poses for sliding window.
+
+        Each token k in frame i predicts T(frame_i -> frame_{i-k-1}).
 
         Args:
             gt_poses: List of (trans, quat) tuples for each view
@@ -450,52 +450,89 @@ class Regr3DPose(Criterion, MultiLoss):
             eps: Small value for numerical stability
 
         Returns:
-            gt_relative_poses: (gt_rel_trans, gt_rel_rot) batched tensors or (None, None)
-            pr_relative_poses: (pr_rel_trans_aligned, pr_rel_rot) batched tensors or (None, None)
+            gt_relative_poses: dict with 'trans' (N, K, B, 3), 'rot' (N, K, B, 3, 3), 'valid' (N, K)
+            pr_relative_poses: dict with 'trans' (N, K, B, 3), 'rot' (N, K, B, 3, 3)
+            or (None, None) if no valid predictions
         """
-        N = len(preds)
-        if N < 2:
-            return (None, None), (None, None)
+        N_frames = len(preds)
+        if N_frames < 2:
+            return None, None
 
-        # Check which frames have relative_pose predictions
-        valid_indices = [i for i in range(1, N) if "relative_pose" in preds[i]]
-        if not valid_indices:
-            return (None, None), (None, None)
+        # Find K from first pred that has relative_poses
+        K = None
+        for i in range(1, N_frames):
+            if "relative_poses" in preds[i] and preds[i]["relative_poses"] is not None:
+                K = preds[i]["relative_poses"].shape[1]
+                break
+        if K is None:
+            return None, None
 
-        # Batch GT: stack all translations and quaternions
         gt_trans_all = torch.stack([pose[0] for pose in gt_poses], dim=0)  # (N, B, 3)
         gt_quats_all = torch.stack([pose[1] for pose in gt_poses], dim=0)  # (N, B, 4)
         B = gt_trans_all.shape[1]
+        device = gt_trans_all.device
+        gt_R_all = quaternion_to_matrix(gt_quats_all.view(-1, 4)).view(N_frames, B, 3, 3)
 
-        # Batch convert GT quaternions to rotation matrices
-        gt_R_all = quaternion_to_matrix(gt_quats_all.view(-1, 4)).view(N, B, 3, 3)  # (N, B, 3, 3)
+        # Which frames have valid predictions?
+        has_pred = torch.tensor(
+            ["relative_poses" in preds[i] and preds[i]["relative_poses"] is not None
+             for i in range(N_frames)],
+            dtype=torch.bool, device=device
+        )
 
-        # Compute GT relative poses in batch: R_rel = R_curr^T @ R_prev, t_rel = R_curr^T @ (t_prev - t_curr)
-        gt_R_prev = gt_R_all[:-1]  # (N-1, B, 3, 3)
-        gt_R_curr = gt_R_all[1:]   # (N-1, B, 3, 3)
-        gt_R_curr_T = gt_R_curr.transpose(-2, -1)  # (N-1, B, 3, 3)
-        gt_R_rel_all = torch.matmul(gt_R_curr_T, gt_R_prev)  # (N-1, B, 3, 3)
+        # Build index grid for all valid (i, k, ref) triples
+        i_range = torch.arange(1, N_frames, device=device)
+        k_range = torch.arange(K, device=device)
+        i_grid, k_grid = torch.meshgrid(i_range, k_range, indexing='ij')  # (N-1, K)
+        ref_grid = i_grid - k_grid - 1
 
-        gt_trans_prev = gt_trans_all[:-1]  # (N-1, B, 3)
-        gt_trans_curr = gt_trans_all[1:]   # (N-1, B, 3)
-        delta_trans = gt_trans_prev - gt_trans_curr  # (N-1, B, 3)
-        gt_rel_trans_all = torch.matmul(gt_R_curr_T, delta_trans.unsqueeze(-1)).squeeze(-1)  # (N-1, B, 3)
+        valid_2d = (ref_grid >= 0) & has_pred[i_grid]
+        i_idx = i_grid[valid_2d]
+        k_idx = k_grid[valid_2d]
+        ref_idx = ref_grid[valid_2d]
+        M = i_idx.shape[0]
 
-        # Extract predicted relative poses in batch
-        pred_rel_poses = torch.stack([preds[i]["relative_pose"] for i in valid_indices], dim=0)  # (M, B, 4, 4)
-        pred_rel_trans = pred_rel_poses[:, :, :3, 3]  # (M, B, 3)
-        pred_rel_rot = pred_rel_poses[:, :, :3, :3]   # (M, B, 3, 3)
+        # Batch compute GT relative poses (2 bmm calls instead of M)
+        R_i = gt_R_all[i_idx]        # (M, B, 3, 3)
+        R_ref = gt_R_all[ref_idx]    # (M, B, 3, 3)
+        t_i = gt_trans_all[i_idx]    # (M, B, 3)
+        t_ref = gt_trans_all[ref_idx]
 
-        # Align predicted translations
-        scale = S_flat.view(1, -1, 1) / pose_norm_factor_pr.view(1, -1, 1).clip(eps)  # (1, B, 1)
-        pred_rel_trans_aligned = pred_rel_trans * scale  # (M, B, 3)
+        R_i_T = R_i.transpose(-2, -1)
+        MB = M * B
+        rel_rot = torch.bmm(R_i_T.reshape(MB, 3, 3), R_ref.reshape(MB, 3, 3)).view(M, B, 3, 3)
+        delta_t = (t_ref - t_i).unsqueeze(-1)
+        rel_trans = torch.bmm(R_i_T.reshape(MB, 3, 3), delta_t.reshape(MB, 3, 1)).view(M, B, 3)
 
-        # Select only valid GT relative poses (indices 0..N-2 correspond to frames 1..N-1)
-        valid_gt_indices = [i - 1 for i in valid_indices]  # Convert frame indices to relative pose indices
-        gt_rel_trans = gt_rel_trans_all[valid_gt_indices]  # (M, B, 3)
-        gt_R_rel = gt_R_rel_all[valid_gt_indices]          # (M, B, 3, 3)
+        # Scatter into output tensors
+        gt_rel_trans = torch.zeros(N_frames, K, B, 3, device=device, dtype=gt_trans_all.dtype)
+        gt_rel_rot = torch.zeros(N_frames, K, B, 3, 3, device=device, dtype=gt_trans_all.dtype)
+        valid_mask = torch.zeros(N_frames, K, dtype=torch.bool, device=device)
+        gt_rel_rot[i_idx, k_idx] = rel_rot
+        gt_rel_trans[i_idx, k_idx] = rel_trans
+        valid_mask[i_idx, k_idx] = True
 
-        return (gt_rel_trans, gt_R_rel), (pred_rel_trans_aligned, pred_rel_rot)
+        # Batch extract predicted relative poses
+        pr_rel_trans = torch.zeros_like(gt_rel_trans)
+        pr_rel_rot = torch.zeros_like(gt_rel_rot)
+        valid_frame_indices = torch.where(has_pred)[0]
+        valid_frame_indices = valid_frame_indices[valid_frame_indices > 0]
+
+        if len(valid_frame_indices) > 0:
+            stacked_preds = torch.stack(
+                [preds[i]["relative_poses"] for i in valid_frame_indices.tolist()], dim=0
+            )  # (num_valid, B, K, 4, 4)
+            pr_rel_trans[valid_frame_indices] = stacked_preds[:, :, :, :3, 3].permute(0, 2, 1, 3)
+            pr_rel_rot[valid_frame_indices] = stacked_preds[:, :, :, :3, :3].permute(0, 2, 1, 3, 4)
+
+        # Apply scale alignment to predicted translations
+        scale = S_flat.view(1, 1, -1, 1) / pose_norm_factor_pr.view(1, 1, -1, 1).clip(eps)
+        pr_rel_trans = pr_rel_trans * scale
+
+        return (
+            {'trans': gt_rel_trans, 'rot': gt_rel_rot, 'valid': valid_mask},
+            {'trans': pr_rel_trans, 'rot': pr_rel_rot}
+        )
 
     def get_all_pts3d(
         self,
@@ -675,14 +712,9 @@ class Regr3DPose(Criterion, MultiLoss):
                 for pr in pr_pts_self
             ]
 
-        # Compute relative poses
-        gt_relative_poses, pr_relative_poses = self._compute_relative_poses(
+        # Compute relative poses (sliding window)
+        gt_relative_poses, pr_relative_poses = self._compute_relative_poses_window(
             gt_poses, preds, pose_norm_factor_pr, S_flat, eps
-        )
-
-        # Compute accumulated poses from relative poses (for accumulated pose loss)
-        accumulated_poses = self._accumulate_relative_poses(
-            preds, pose_norm_factor_pr, S_flat, eps
         )
 
         skys = [gt["sky_mask"] & ~valid for gt, valid in zip(gts, valids)]
@@ -698,7 +730,6 @@ class Regr3DPose(Criterion, MultiLoss):
             pose_masks,
             gt_relative_poses,
             pr_relative_poses,
-            accumulated_poses,
             {},  # monitoring (empty dict for consistency)
         )
 
@@ -857,10 +888,9 @@ class Regr3DPose(Criterion, MultiLoss):
             # # do not add cross view loss when there is only camera supervision
 
         skys = [gt["sky_mask"] & ~valid for gt, valid in zip(gts, valids)]
-        # Note: get_all_pts3d_with_scale_loss doesn't compute relative poses or accumulated poses
+        # Note: get_all_pts3d_with_scale_loss doesn't compute relative poses
         gt_relative_poses = []
         pr_relative_poses = []
-        accumulated_poses = []
         return (
             gt_pts_self,
             gt_pts_cross,
@@ -873,7 +903,6 @@ class Regr3DPose(Criterion, MultiLoss):
             pose_masks,
             gt_relative_poses,
             pr_relative_poses,
-            accumulated_poses,
             {"scale_loss": pose_scale_loss + pts_scale_loss},
         )
 
@@ -957,142 +986,45 @@ class Regr3DPose(Criterion, MultiLoss):
         return R_err.mean()         # [0, 3.14]
 
     def compute_relative_pose_token_loss(self, gt_relative_poses, pr_relative_poses):
-        """Compute relative pose token loss from pre-aligned relative poses.
+        """Compute relative pose token loss from sliding window relative poses.
 
         Args:
-            gt_relative_poses: (gt_rel_trans, gt_rel_rot) batched tensors
-                - gt_rel_trans: (M, B, 3) GT relative translations
-                - gt_rel_rot: (M, B, 3, 3) GT relative rotation matrices
-            pr_relative_poses: (pr_rel_trans, pr_rel_rot) batched tensors
-                - pr_rel_trans: (M, B, 3) predicted relative translations (aligned)
-                - pr_rel_rot: (M, B, 3, 3) predicted relative rotation matrices
+            gt_relative_poses: dict with 'trans' (N, K, B, 3), 'rot' (N, K, B, 3, 3), 'valid' (N, K)
+                or None
+            pr_relative_poses: dict with 'trans' (N, K, B, 3), 'rot' (N, K, B, 3, 3)
+                or None
 
         Returns:
             relative_pose_loss: Weighted sum of translation and rotation losses
         """
         from dust3r.utils.camera import rotation_matrix_to_9d
 
-        gt_trans, gt_rot = gt_relative_poses
-        pr_trans, pr_rot = pr_relative_poses
-
-        # Check for None (no valid relative poses)
-        if gt_trans is None or pr_trans is None:
+        if gt_relative_poses is None or pr_relative_poses is None:
             return torch.tensor(0.0), {}
 
-        # Batch translation loss: L1
-        trans_loss = torch.abs(pr_trans - gt_trans).mean()
+        gt_trans = gt_relative_poses['trans']     # (N, K, B, 3)
+        gt_rot = gt_relative_poses['rot']         # (N, K, B, 3, 3)
+        valid = gt_relative_poses['valid']        # (N, K)
+        pr_trans = pr_relative_poses['trans']
+        pr_rot = pr_relative_poses['rot']
 
-        # Batch rotation loss: 9D L1
-        gt_rot_9d = rotation_matrix_to_9d(gt_rot.flatten(0, 1)).view(*gt_rot.shape[:2], 9)  # (M, B, 9)
-        pr_rot_9d = rotation_matrix_to_9d(pr_rot.flatten(0, 1)).view(*pr_rot.shape[:2], 9)  # (M, B, 9)
+        if not valid.any():
+            return torch.tensor(0.0), {}
+
+        # Translation L1 loss (only valid pairs)
+        # Expand valid mask to match trans shape: (N, K) -> (N, K, B, 3)
+        valid_mask_t = valid.unsqueeze(-1).unsqueeze(-1).expand_as(gt_trans)
+        trans_diff = torch.abs(pr_trans - gt_trans)
+        trans_loss = trans_diff[valid_mask_t].mean()
+
+        # Rotation 9D L1 loss (only valid pairs)
+        # Select valid entries: valid is (N, K), we need to index (N, K, B, 3, 3)
+        valid_indices = valid.nonzero(as_tuple=True)  # (valid_n, valid_k)
+        gt_rot_valid = gt_rot[valid_indices[0], valid_indices[1]]  # (num_valid, B, 3, 3)
+        pr_rot_valid = pr_rot[valid_indices[0], valid_indices[1]]  # (num_valid, B, 3, 3)
+        gt_rot_9d = rotation_matrix_to_9d(gt_rot_valid.flatten(0, 1)).view(-1, 9)
+        pr_rot_9d = rotation_matrix_to_9d(pr_rot_valid.flatten(0, 1)).view(-1, 9)
         rot_loss = torch.abs(pr_rot_9d - gt_rot_9d).mean()
-
-        # Apply loss weights
-        trans_loss_weight = getattr(self, 'trans_loss_weight', 1.0)
-        return trans_loss_weight * trans_loss + self.rot_loss_weight * rot_loss, {}
-
-    def _accumulate_relative_poses(self, preds, pose_norm_factor_pr, S_flat, eps=1e-3):
-        """Accumulate relative poses to get global poses using batch operations.
-
-        The model predicts T_rel such that: c2w_curr = c2w_prev @ inv(T_rel)
-
-        Args:
-            preds: List of prediction dictionaries containing 'relative_pose'
-            pose_norm_factor_pr: Normalization factor for predicted poses (B, 1)
-            S_flat: Scale alignment factor (B,)
-            eps: Small value for numerical stability
-
-        Returns:
-            accumulated_poses: (acc_trans_aligned, acc_R) batched tensors
-                - acc_trans_aligned: (N, B, 3) aligned accumulated translations
-                - acc_R: (N, B, 3, 3) accumulated rotation matrices
-        """
-        N = len(preds)
-        if N < 1:
-            return (None, None)
-
-        # Get batch size and device
-        first_pred = preds[0]
-        if "relative_pose" in first_pred:
-            B = first_pred["relative_pose"].shape[0]
-            device = first_pred["relative_pose"].device
-            dtype = first_pred["relative_pose"].dtype
-        else:
-            B = first_pred["camera_pose"].shape[0]
-            device = first_pred["camera_pose"].device
-            dtype = first_pred["camera_pose"].dtype
-
-        # Find valid indices (frames with relative_pose)
-        valid_indices = [i for i in range(1, N) if "relative_pose" in preds[i]]
-        if not valid_indices:
-            # Only first frame (identity)
-            acc_trans = torch.zeros(1, B, 3, device=device, dtype=dtype)
-            acc_R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).unsqueeze(0).expand(1, B, 3, 3).clone()
-            return (acc_trans, acc_R)
-
-        # Batch extract and invert all relative poses at once
-        rel_poses = torch.stack([preds[i]["relative_pose"] for i in valid_indices], dim=0)  # (M, B, 4, 4)
-        M = rel_poses.shape[0]
-        rel_poses_inv = torch.inverse(rel_poses.view(-1, 4, 4).float()).view(M, B, 4, 4).to(dtype)
-
-        # Prepare output tensors: include first frame (identity) + accumulated frames
-        all_trans = torch.zeros(M + 1, B, 3, device=device, dtype=dtype)
-        all_R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).unsqueeze(0).expand(M + 1, B, 3, 3).clone()
-
-        # Sequential accumulation (unavoidable due to dependency)
-        current_T_c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1).clone()
-        for i in range(M):
-            current_T_c2w = current_T_c2w @ rel_poses_inv[i]
-            all_trans[i + 1] = current_T_c2w[:, :3, 3]
-            all_R[i + 1] = current_T_c2w[:, :3, :3]
-
-        # Batch align translations
-        scale = S_flat.view(1, -1, 1) / pose_norm_factor_pr.view(1, -1, 1).clip(eps)  # (1, B, 1)
-        all_trans_aligned = all_trans * scale  # (M+1, B, 3)
-
-        return (all_trans_aligned, all_R)
-
-    def compute_accumulated_pose_loss(self, gt_poses, accumulated_poses):
-        """Compute loss on accumulated global poses.
-
-        Args:
-            gt_poses: List of (gt_trans, gt_quat) tuples for each view
-            accumulated_poses: (acc_trans_aligned, acc_R) batched tensors
-                - acc_trans_aligned: (N, B, 3) aligned accumulated translations
-                - acc_R: (N, B, 3, 3) accumulated rotation matrices
-
-        Returns:
-            accumulated_pose_loss: Weighted sum of translation and rotation losses
-        """
-        from dust3r.utils.camera import rotation_matrix_to_9d, quaternion_to_matrix
-
-        acc_trans, acc_rot = accumulated_poses
-
-        if acc_trans is None or len(gt_poses) < 1:
-            return torch.tensor(0.0), {}
-
-        N = min(len(gt_poses), acc_trans.shape[0])
-        if N < 1:
-            return torch.tensor(0.0), {}
-
-        # Batch GT poses: stack translations and quaternions
-        gt_trans = torch.stack([gt_poses[i][0] for i in range(N)], dim=0)  # (N, B, 3)
-        gt_quat = torch.stack([gt_poses[i][1] for i in range(N)], dim=0)   # (N, B, 4)
-
-        # Slice accumulated poses to match
-        acc_trans = acc_trans[:N]  # (N, B, 3)
-        acc_rot = acc_rot[:N]      # (N, B, 3, 3)
-
-        # Batch convert GT quaternions to rotation matrices
-        gt_rot = quaternion_to_matrix(gt_quat.flatten(0, 1)).view(N, -1, 3, 3)  # (N, B, 3, 3)
-
-        # Batch translation loss: L1
-        trans_loss = torch.abs(acc_trans - gt_trans).mean()
-
-        # Batch rotation loss: 9D L1
-        gt_rot_9d = rotation_matrix_to_9d(gt_rot.flatten(0, 1)).view(N, -1, 9)    # (N, B, 9)
-        acc_rot_9d = rotation_matrix_to_9d(acc_rot.flatten(0, 1)).view(N, -1, 9)  # (N, B, 9)
-        rot_loss = torch.abs(acc_rot_9d - gt_rot_9d).mean()
 
         # Apply loss weights
         trans_loss_weight = getattr(self, 'trans_loss_weight', 1.0)
@@ -1111,7 +1043,6 @@ class Regr3DPose(Criterion, MultiLoss):
             pose_masks,
             gt_relative_poses,
             pr_relative_poses,
-            accumulated_poses,
             monitoring,
         ) = self.get_all_pts3d(gts, preds, **kw)
 
@@ -1213,13 +1144,6 @@ class Regr3DPose(Criterion, MultiLoss):
             )
             details["relative_pose_token_loss"] = relative_pose_token_loss
 
-        # Conditionally compute accumulated pose loss
-        if self.use_accumulated_pose_loss:
-            accumulated_pose_loss, _ = self.compute_accumulated_pose_loss(
-                gt_poses, accumulated_poses
-            )
-            details["accumulated_pose_loss"] = accumulated_pose_loss
-
         return Sum(*list(zip(ls, masks))), details
 
 
@@ -1244,14 +1168,13 @@ class Regr3DPoseBatchList(Regr3DPose):
         use_pts_loss=True,
         use_pose_loss=False,
         use_relative_pose_loss=True,
-        use_accumulated_pose_loss=False,
         rot_loss_weight=10.0,
         trans_loss_weight=1.0,
         use_align_scale=False,
     ):
         super().__init__(
             criterion, norm_mode, gt_scale, sky_loss_value, max_metric_scale,
-            use_pts_loss, use_pose_loss, use_relative_pose_loss, use_accumulated_pose_loss,
+            use_pts_loss, use_pose_loss, use_relative_pose_loss,
             rot_loss_weight, trans_loss_weight, use_align_scale
         )
         self.depth_only_criterion = DepthScaleShiftInvLoss()
@@ -1280,7 +1203,6 @@ class Regr3DPoseBatchList(Regr3DPose):
             pose_masks,
             gt_relative_poses,
             pr_relative_poses,
-            accumulated_poses,
             monitoring,
         ) = self.get_all_pts3d(gts, preds, **kw)
 
@@ -1430,13 +1352,6 @@ class Regr3DPoseBatchList(Regr3DPose):
             )
             details["relative_pose_token_loss"] = relative_pose_token_loss
 
-        # Conditionally compute accumulated pose loss
-        if self.use_accumulated_pose_loss:
-            accumulated_pose_loss, _ = self.compute_accumulated_pose_loss(
-                gt_poses, accumulated_poses
-            )
-            details["accumulated_pose_loss"] = accumulated_pose_loss
-
         return Sum(*list(zip(ls, masks))), details
 
 
@@ -1454,7 +1369,6 @@ class ConfLoss(MultiLoss):
         use_pts_loss: Use confidence-weighted point cloud loss
         use_pose_loss: Use absolute pose loss
         use_relative_pose_loss: Use relative pose token loss
-        use_accumulated_pose_loss: Use accumulated pose loss from relative poses
     """
 
     def __init__(self, pixel_loss, alpha=1):
@@ -1467,7 +1381,6 @@ class ConfLoss(MultiLoss):
         self.use_pts_loss = getattr(pixel_loss, 'use_pts_loss', True)  # Default True for backward compat
         self.use_pose_loss = getattr(pixel_loss, 'use_pose_loss', False)
         self.use_relative_pose_loss = getattr(pixel_loss, 'use_relative_pose_loss', True)
-        self.use_accumulated_pose_loss = getattr(pixel_loss, 'use_accumulated_pose_loss', False)
 
     def get_name(self):
         return f"ConfLoss({self.pixel_loss})"
@@ -1534,9 +1447,6 @@ class ConfLoss(MultiLoss):
         if self.use_relative_pose_loss and "relative_pose_token_loss" in details:
             final_loss = final_loss + details["relative_pose_token_loss"]
 
-        if self.use_accumulated_pose_loss and "accumulated_pose_loss" in details:
-            final_loss = final_loss + details["accumulated_pose_loss"]
-
         return final_loss, details
 
 
@@ -1559,7 +1469,6 @@ class Regr3DPose_ScaleInv(Regr3DPose):
             pose_masks,
             gt_relative_poses,
             pr_relative_poses,
-            accumulated_poses,
             monitoring,
         ) = super().get_all_pts3d(gts, preds, **kw)
 
@@ -1606,6 +1515,5 @@ class Regr3DPose_ScaleInv(Regr3DPose):
             pose_masks,
             gt_relative_poses,
             pr_relative_poses,
-            accumulated_poses,
             monitoring,
         )

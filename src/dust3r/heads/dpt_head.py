@@ -344,14 +344,15 @@ class DPTPts3dPoseWithRelativePose(nn.Module):
             with torch.cuda.amp.autocast(enabled=False):
                 pose = self.pose_head(pose_token)
                 rel_pose_token = kwargs.get("rel_pose_token")
-                prev_pose_token = kwargs.get("prev_pose_token")  # Get prev_pose_token (B, hidden_size)
+                n_valid_tokens = kwargs.get("n_valid_tokens")
                 if rel_pose_token is not None:
-                    relative_pose = self.relative_pose_head(
+                    relative_poses, valid_mask = self.relative_pose_head(
                         rel_pose_token,          # (B, num_tokens, hidden_size)
-                        prev_pose_token=prev_pose_token  # (B, hidden_size)
+                        n_valid_tokens=n_valid_tokens,
                     )
                 else:
-                    relative_pose = None
+                    relative_poses = None
+                    valid_mask = None
             token_cross = token.clone()
             for blk in self.final_transform:
                 token_cross = blk(token_cross, pose_token, kwargs.get("pos"))
@@ -383,9 +384,13 @@ class DPTPts3dPoseWithRelativePose(nn.Module):
             if self.has_pose:
                 pose = postprocess_pose(pose, self.pose_mode)
                 final_output["camera_pose"] = pose  # B,7
-                if relative_pose is not None:
-                    final_output["relative_pose"] = relative_pose  # B,4,4
+                if relative_poses is not None:
+                    final_output["relative_poses"] = relative_poses       # (B, N, 4, 4)
+                    final_output["relative_poses_valid"] = valid_mask      # (B, N)
+                    final_output["relative_pose"] = relative_poses[:, 0]  # (B, 4, 4) backward compat
                 else:
+                    final_output["relative_poses"] = None
+                    final_output["relative_poses_valid"] = None
                     final_output["relative_pose"] = None
                 cross_out = checkpoint(
                     self.dpt_cross,

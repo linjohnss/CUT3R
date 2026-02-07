@@ -123,6 +123,8 @@ class Attention(nn.Module):
         if return_attn:
             # Compute attention manually to extract attention weights
             attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, N, N]
+            if attn_mask is not None:
+                attn = attn.masked_fill(~attn_mask, float('-inf'))
             attn_before_softmax = attn.detach().clone()
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -243,6 +245,8 @@ class CrossAttention(nn.Module):
         if return_attn:
             # Compute attention manually to extract attention weights
             attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, Nq, Nk]
+            if attn_mask is not None:
+                attn = attn.masked_fill(~attn_mask, float('-inf'))
             attn_before_softmax = attn.detach().clone()
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -311,10 +315,10 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, y, xpos, ypos, self_attn_mask=None, cross_attn_mask=None, return_attn=False):
         if return_attn:
-            self_attn_output, self_attn = self.attn(self.norm1(x), xpos, return_attn=True)
+            self_attn_output, self_attn = self.attn(self.norm1(x), xpos, attn_mask=self_attn_mask, return_attn=True)
             x = x + self.drop_path(self_attn_output)
             y_ = self.norm_y(y)
-            cross_attn_output, cross_attn = self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, return_attn=True)
+            cross_attn_output, cross_attn = self.cross_attn(self.norm2(x), y_, y_, xpos, ypos, attn_mask=cross_attn_mask, return_attn=True)
             x = x + self.drop_path(cross_attn_output)
             x = x + self.drop_path(self.mlp(self.norm3(x)))
             return x, y, self_attn, cross_attn
