@@ -287,7 +287,7 @@ class ARCroco3DStereo(CroCoNet):
             torch.randn(1, self.enc_embed_dim) * 0.02, requires_grad=True
         )
         self.relative_pose_token = nn.Parameter(
-            torch.randn(1, config.num_prompt_tokens, self.dec_embed_dim) * 0.02, requires_grad=True
+            torch.randn(1, 1, self.dec_embed_dim) * 0.02, requires_grad=True
         )
         self.prev_pose_proj = nn.Linear(self.dec_embed_dim, self.dec_embed_dim)
         self.num_prompt_tokens = config.num_prompt_tokens
@@ -837,6 +837,57 @@ class ARCroco3DStereo(CroCoNet):
     def _get_img_level_feat(self, feat):
         return torch.mean(feat, dim=1, keepdim=True)
 
+    def _assemble_rel_pose_tokens(self, B, device, dtype, pose_token_buffer, ref_frame_indices=None):
+        """Assemble relative pose tokens from buffer with dynamic token count.
+
+        Args:
+            B: batch size
+            device: torch device
+            dtype: torch dtype for positions
+            pose_token_buffer: List[Tuple[int, Tensor]] — (frame_idx, feat) pairs
+            ref_frame_indices: Optional[List[int]] — specify reference frame indices;
+                None uses automatic sliding window (most recent entries from buffer)
+
+        Returns:
+            rel_pose_feat: (B, n_actual, D) or None if n_actual == 0
+            rel_pose_pos:  (B, n_actual, 2) or None if n_actual == 0
+            n_actual: int — number of actual tokens assembled
+            ref_indices: List[int] — frame indices of the assembled references
+        """
+        if ref_frame_indices is None:
+            # Automatic: use all entries from buffer
+            n_actual = len(pose_token_buffer)
+            if n_actual == 0:
+                return None, None, 0, []
+            # Most recent first
+            selected = pose_token_buffer[-n_actual:][::-1]  # reversed so [0] = most recent
+            ref_indices = [frame_idx for frame_idx, _ in selected]
+            ref_feats = [feat for _, feat in selected]
+        else:
+            # Explicit reference frame selection: look up from buffer
+            buffer_dict = {frame_idx: feat for frame_idx, feat in pose_token_buffer}
+            ref_indices = []
+            ref_feats = []
+            for idx in ref_frame_indices:
+                if idx in buffer_dict:
+                    ref_indices.append(idx)
+                    ref_feats.append(buffer_dict[idx])
+            n_actual = len(ref_indices)
+            if n_actual == 0:
+                return None, None, 0, []
+            # Reverse to match training convention: k=0 = most recent reference
+            ref_indices = ref_indices[::-1]
+            ref_feats = ref_feats[::-1]
+
+        # Assemble: replicate single shared token + project reference features
+        rel_pose_feat = self.relative_pose_token[:, 0:1, :].expand(B, n_actual, -1).clone()
+        for k, ref_feat in enumerate(ref_feats):
+            rel_pose_feat[:, k, :] = rel_pose_feat[:, k, :] + self.prev_pose_proj(ref_feat)
+
+        rel_pose_pos = -torch.ones(B, n_actual, 2, device=device, dtype=dtype)
+
+        return rel_pose_feat, rel_pose_pos, n_actual, ref_indices
+
     def _forward_encoder(self, views):
         shape, feat_ls, pos = self._encode_views(views)
         feat = feat_ls[-1]
@@ -879,22 +930,15 @@ class ARCroco3DStereo(CroCoNet):
             )
 
             B = feat_i.shape[0]
-            n_prompt_tokens = self.num_prompt_tokens
-            rel_pose_feat_i = self.relative_pose_token.expand(B, -1, -1).clone()
-            if len(pose_token_buffer) > 0:
-                for k in range(min(n_prompt_tokens, len(pose_token_buffer))):
-                    ref_token = pose_token_buffer[-(k + 1)]
-                    rel_pose_feat_i[:, k, :] = rel_pose_feat_i[:, k, :] + self.prev_pose_proj(ref_token)
-
-            rel_pose_pos_i = -torch.ones(
-                feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
-            )
+            rel_pose_feat_i, rel_pose_pos_i, n_actual, ref_indices = \
+                self._assemble_rel_pose_tokens(B, feat_i.device, pos_i.dtype, pose_token_buffer)
         else:
             pose_feat_i = None
             pose_pos_i = None
             rel_pose_feat_i = None
             rel_pose_pos_i = None
-            n_prompt_tokens = 0
+            n_actual = 0
+            ref_indices = []
 
         new_state_feat, dec, _, _, _, _ = self._recurrent_rollout(
             state_feat,
@@ -916,14 +960,14 @@ class ARCroco3DStereo(CroCoNet):
             mem, global_img_feat_i, out_pose_feat_i
         )
 
-        if n_prompt_tokens > 0:
+        if n_actual > 0:
             head_input = [
                 dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:-n_actual].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:-n_actual].float(),
+                dec[self.dec_depth][:, :-n_actual].float(),
             ]
-            rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+            rel_pose_token = dec[self.dec_depth][:, -n_actual:].float()
             # Residual connection: add original prompt tokens to decoder output
             rel_pose_token = rel_pose_token + rel_pose_feat_i
         else:
@@ -935,19 +979,17 @@ class ARCroco3DStereo(CroCoNet):
             ]
             rel_pose_token = None
 
-        n_valid_tokens = min(i, self.num_prompt_tokens)
         res = self._downstream_head(
             head_input,
             shape_i,
             pos=pos_i,
             rel_pose_token=rel_pose_token,
-            n_valid_tokens=n_valid_tokens,
+            n_valid_tokens=n_actual,
+            ref_frame_indices=ref_indices,
         )
 
-        # Update pose_token_buffer
-        pose_token_buffer.append(out_pose_feat_i.squeeze(1).detach())
-        if len(pose_token_buffer) > self.num_prompt_tokens:
-            pose_token_buffer = pose_token_buffer[-self.num_prompt_tokens:]
+        # Update pose_token_buffer with (frame_idx, feat) tuple
+        pose_token_buffer.append((i, out_pose_feat_i.squeeze(1).detach()))
 
         img_mask = views[i]["img_mask"]
         update = views[i].get("update", None)
@@ -986,8 +1028,7 @@ class ARCroco3DStereo(CroCoNet):
         model_update_type = getattr(self.config, 'model_update_type', 'cut3r')
         use_ttt3r = model_update_type == "ttt3r"
 
-        n_prompt_tokens = self.num_prompt_tokens
-        pose_token_buffer = []  # Sliding window buffer for pose tokens
+        pose_token_buffer = []  # Sliding window buffer for pose tokens: List[Tuple[int, Tensor]]
 
         for i in range(len(views)):
             feat_i = feat[i]
@@ -1004,21 +1045,15 @@ class ARCroco3DStereo(CroCoNet):
                 )
 
                 B = feat_i.shape[0]
-                rel_pose_feat_i = self.relative_pose_token.expand(B, -1, -1).clone()
-                if len(pose_token_buffer) > 0:
-                    for k in range(min(n_prompt_tokens, len(pose_token_buffer))):
-                        ref_token = pose_token_buffer[-(k + 1)]
-                        rel_pose_feat_i[:, k, :] = rel_pose_feat_i[:, k, :] + self.prev_pose_proj(ref_token)
-
-                rel_pose_pos_i = -torch.ones(
-                    feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
-                )
+                rel_pose_feat_i, rel_pose_pos_i, n_actual, ref_indices = \
+                    self._assemble_rel_pose_tokens(B, feat_i.device, pos_i.dtype, pose_token_buffer)
             else:
                 pose_feat_i = None
                 pose_pos_i = None
                 rel_pose_feat_i = None
                 rel_pose_pos_i = None
-                n_prompt_tokens = 0
+                n_actual = 0
+                ref_indices = []
 
             # For TTT3R, we need attention maps only for frames after the first
             return_attn = use_ttt3r and (i > 0)
@@ -1045,14 +1080,14 @@ class ARCroco3DStereo(CroCoNet):
             assert len(dec) == self.dec_depth + 1
 
             # Build head input and extract rel_pose_token
-            if n_prompt_tokens > 0:
+            if n_actual > 0:
                 head_input = [
                     dec[0].float(),
-                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:-n_actual].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:-n_actual].float(),
+                    dec[self.dec_depth][:, :-n_actual].float(),
                 ]
-                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+                rel_pose_token = dec[self.dec_depth][:, -n_actual:].float()
                 # Residual connection: add original prompt tokens to decoder output
                 rel_pose_token = rel_pose_token + rel_pose_feat_i
             else:
@@ -1064,13 +1099,10 @@ class ARCroco3DStereo(CroCoNet):
                 ]
                 rel_pose_token = None
 
-            n_valid_tokens = min(i, self.num_prompt_tokens)
-            res = self._downstream_head(head_input, shape[i], pos=pos_i, rel_pose_token=rel_pose_token, n_valid_tokens=n_valid_tokens)
+            res = self._downstream_head(head_input, shape[i], pos=pos_i, rel_pose_token=rel_pose_token, n_valid_tokens=n_actual, ref_frame_indices=ref_indices)
 
-            # Update pose_token_buffer
-            pose_token_buffer.append(out_pose_feat_i.squeeze(1).detach())
-            if len(pose_token_buffer) > self.num_prompt_tokens:
-                pose_token_buffer = pose_token_buffer[-self.num_prompt_tokens:]
+            # Update pose_token_buffer with (frame_idx, feat) tuple
+            pose_token_buffer.append((i, out_pose_feat_i.squeeze(1).detach()))
 
             ress.append(res)
             img_mask = views[i]["img_mask"]
@@ -1146,7 +1178,10 @@ class ARCroco3DStereo(CroCoNet):
             return ARCroco3DStereoOutput(ress=ress, views=views)
 
     def inference_step(
-        self, view, state_feat, state_pos, init_state_feat, mem, init_mem, pose_token_buffer=None
+        self, view, state_feat, state_pos, init_state_feat, mem, init_mem,
+        pose_token_buffer=None,
+        frame_idx=None,
+        ref_frame_indices=None,
     ):
         batch_size = view["img"].shape[0]
         raymaps = []
@@ -1170,7 +1205,6 @@ class ARCroco3DStereo(CroCoNet):
 
         feat_i = feat_ls[-1]
         pos_i = pos
-        n_prompt_tokens = self.num_prompt_tokens
 
         if self.pose_head_flag:
             global_img_feat_i = self._get_img_level_feat(feat_i)
@@ -1182,21 +1216,15 @@ class ARCroco3DStereo(CroCoNet):
             if pose_token_buffer is None:
                 pose_token_buffer = []
             B = batch_size
-            rel_pose_feat_i = self.relative_pose_token.expand(B, -1, -1).clone()
-            if len(pose_token_buffer) > 0:
-                for k in range(min(n_prompt_tokens, len(pose_token_buffer))):
-                    ref_token = pose_token_buffer[-(k + 1)]
-                    rel_pose_feat_i[:, k, :] = rel_pose_feat_i[:, k, :] + self.prev_pose_proj(ref_token)
-
-            rel_pose_pos_i = -torch.ones(
-                batch_size, n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
-            )
+            rel_pose_feat_i, rel_pose_pos_i, n_actual, ref_indices_out = \
+                self._assemble_rel_pose_tokens(B, feat_i.device, pos_i.dtype, pose_token_buffer, ref_frame_indices)
         else:
             pose_feat_i = None
             pose_pos_i = None
             rel_pose_feat_i = None
             rel_pose_pos_i = None
-            n_prompt_tokens = 0
+            n_actual = 0
+            ref_indices_out = []
 
         new_state_feat, dec, _, _, _, _ = self._recurrent_rollout(
             state_feat,
@@ -1221,14 +1249,14 @@ class ARCroco3DStereo(CroCoNet):
         assert len(dec) == self.dec_depth + 1
 
         # Build head input and extract rel_pose_token
-        if n_prompt_tokens > 0:
+        if n_actual > 0:
             head_input = [
                 dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:-n_actual].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:-n_actual].float(),
+                dec[self.dec_depth][:, :-n_actual].float(),
             ]
-            rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+            rel_pose_token = dec[self.dec_depth][:, -n_actual:].float()
             # Residual connection: add original prompt tokens to decoder output
             rel_pose_token = rel_pose_token + rel_pose_feat_i
         else:
@@ -1239,17 +1267,17 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth].float(),
             ]
             rel_pose_token = None
-        n_valid_tokens = min(len(pose_token_buffer), self.num_prompt_tokens) if pose_token_buffer else 0
-        res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token, n_valid_tokens=n_valid_tokens)
-        # Update pose_token_buffer
+
+        res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token, n_valid_tokens=n_actual, ref_frame_indices=ref_indices_out)
+        # Update pose_token_buffer with (frame_idx, feat) tuple
         if pose_token_buffer is None:
             pose_token_buffer = []
-        pose_token_buffer.append(out_pose_feat_i.squeeze(1).detach())
-        if len(pose_token_buffer) > self.num_prompt_tokens:
-            pose_token_buffer = pose_token_buffer[-self.num_prompt_tokens:]
+        # Use provided frame_idx or auto-increment based on buffer length
+        actual_frame_idx = frame_idx if frame_idx is not None else len(pose_token_buffer)
+        pose_token_buffer.append((actual_frame_idx, out_pose_feat_i.squeeze(1).detach()))
         return res, view, pose_token_buffer
 
-    def forward_recurrent(self, views, device, ret_state=False):
+    def forward_recurrent(self, views, device, ret_state=False, ref_frame_indices_fn=None, keyframe_indices=None, on_frame_processed=None, buffer_pruning_fn=None):
         ress = []
         all_state_args = []
         processed_views = []  # Store processed views with minimal data
@@ -1259,7 +1287,7 @@ class ARCroco3DStereo(CroCoNet):
         init_state_feat = None
         mem = None
         init_mem = None
-        pose_token_buffer = []  # Sliding window buffer for pose tokens
+        pose_token_buffer = []  # Sliding window buffer: List[Tuple[int, Tensor]]
         # Process views one at a time to save GPU memory
         for i, cpu_view in enumerate(views):
             # Move current view to GPU
@@ -1343,8 +1371,6 @@ class ARCroco3DStereo(CroCoNet):
             if isinstance(reset_mask, torch.Tensor):
                 reset_mask = reset_mask.item() if reset_mask.numel() == 1 else reset_mask.any().item()
 
-            n_prompt_tokens = self.num_prompt_tokens
-
             if self.pose_head_flag:
                 global_img_feat_i = self._get_img_level_feat(feat_i)
                 if i == 0 or reset_mask:
@@ -1356,21 +1382,16 @@ class ARCroco3DStereo(CroCoNet):
                 )
 
                 B = feat_i.shape[0]
-                rel_pose_feat_i = self.relative_pose_token.expand(B, -1, -1).clone()
-                if len(pose_token_buffer) > 0:
-                    for k in range(min(n_prompt_tokens, len(pose_token_buffer))):
-                        ref_token = pose_token_buffer[-(k + 1)]
-                        rel_pose_feat_i[:, k, :] = rel_pose_feat_i[:, k, :] + self.prev_pose_proj(ref_token)
-
-                rel_pose_pos_i = -torch.ones(
-                    feat_i.shape[0], n_prompt_tokens, 2, device=feat_i.device, dtype=pos_i.dtype
-                )
+                requested_refs = ref_frame_indices_fn(i, pose_token_buffer) if ref_frame_indices_fn is not None else None
+                rel_pose_feat_i, rel_pose_pos_i, n_actual, ref_indices = \
+                    self._assemble_rel_pose_tokens(B, feat_i.device, pos_i.dtype, pose_token_buffer, requested_refs)
             else:
                 pose_feat_i = None
                 pose_pos_i = None
                 rel_pose_feat_i = None
                 rel_pose_pos_i = None
-                n_prompt_tokens = 0
+                n_actual = 0
+                ref_indices = []
 
             # For TTT3R, we need attention maps only for frames after the first
             model_update_type = getattr(self.config, 'model_update_type', 'cut3r')
@@ -1401,14 +1422,14 @@ class ARCroco3DStereo(CroCoNet):
             assert len(dec) == self.dec_depth + 1
 
             # Build head input and extract rel_pose_token
-            if n_prompt_tokens > 0:
+            if n_actual > 0:
                 head_input = [
                     dec[0].float(),
-                    dec[self.dec_depth * 2 // 4][:, 1:-n_prompt_tokens].float(),
-                    dec[self.dec_depth * 3 // 4][:, 1:-n_prompt_tokens].float(),
-                    dec[self.dec_depth][:, :-n_prompt_tokens].float(),
+                    dec[self.dec_depth * 2 // 4][:, 1:-n_actual].float(),
+                    dec[self.dec_depth * 3 // 4][:, 1:-n_actual].float(),
+                    dec[self.dec_depth][:, :-n_actual].float(),
                 ]
-                rel_pose_token = dec[self.dec_depth][:, -n_prompt_tokens:].float()
+                rel_pose_token = dec[self.dec_depth][:, -n_actual:].float()
                 # Residual connection: add original prompt tokens to decoder output
                 rel_pose_token = rel_pose_token + rel_pose_feat_i
             else:
@@ -1420,13 +1441,17 @@ class ARCroco3DStereo(CroCoNet):
                 ]
                 rel_pose_token = None
 
-            n_valid_tokens = min(i, self.num_prompt_tokens)
-            res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token, n_valid_tokens=n_valid_tokens)
+            res = self._downstream_head(head_input, shape, pos=pos_i, rel_pose_token=rel_pose_token, n_valid_tokens=n_actual, ref_frame_indices=ref_indices)
 
-            # Update pose_token_buffer
-            pose_token_buffer.append(out_pose_feat_i.squeeze(1).detach())
-            if len(pose_token_buffer) > self.num_prompt_tokens:
-                pose_token_buffer = pose_token_buffer[-self.num_prompt_tokens:]
+            # Update pose_token_buffer with (frame_idx, feat) tuple
+            pose_token_buffer.append((i, out_pose_feat_i.squeeze(1).detach()))
+
+            # Callback: let caller decide if this frame is a keyframe (before pruning)
+            if on_frame_processed is not None:
+                on_frame_processed(i, res)
+
+            if buffer_pruning_fn is not None:
+                pose_token_buffer = buffer_pruning_fn(pose_token_buffer, keyframe_indices)
 
             # Move result to CPU immediately to save GPU memory
             res_cpu = {}
@@ -1478,9 +1503,13 @@ class ARCroco3DStereo(CroCoNet):
                 else:
                     raise ValueError(f"Invalid model_update_type: {model_update_type}")
 
-            state_feat = new_state_feat * update_mask_state + state_feat * (1 - update_mask_state)
-            mem = new_mem * update_mask + mem * (1 - update_mask)
-            
+            # Selective state update: only keyframes write back to state/mem.
+            # Non-keyframe frames are read-only (MUSt3R-style).
+            # When keyframe_indices is None (no keyframe selection), always update.
+            if keyframe_indices is None or i in keyframe_indices:
+                state_feat = new_state_feat * update_mask_state + state_feat * (1 - update_mask_state)
+                mem = new_mem * update_mask + mem * (1 - update_mask)
+
             reset_mask = view["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()

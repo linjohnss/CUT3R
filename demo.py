@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument(
         "--downsample_factor",
         type=int,
-        default=1,
+        default=10,
         help="Downsample factor for the point cloud viewer",
     )
     parser.add_argument(
@@ -128,6 +128,11 @@ def parse_args():
         type=int,
         default=1000000,
         help="Only used for demo, reset state for extremely long sequence, chunks are aligned via global camera poses",
+    )
+    parser.add_argument(
+        "--no_auto_keyframe",
+        action="store_true",
+        help="Disable automatic keyframe selection (default: auto keyframe enabled).",
     )
 
     return parser.parse_args()
@@ -261,7 +266,7 @@ def prepare_input(
 
 
 def prepare_output(
-    outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None, update_interval=1
+    outputs, outdir, revisit=1, use_pose=True, use_relative_pose=None, update_interval=1,
 ):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
@@ -281,8 +286,8 @@ def prepare_output(
         tuple: (points, colors, confidence, camera parameters dictionary)
     """
     from src.dust3r.post_process import estimate_focal_knowing_depth
-    from src.dust3r.utils.camera import pose_encoding_to_camera
-    from src.dust3r.utils.geometry import geotrf, matrix_cumprod
+    from src.dust3r.utils.geometry import geotrf
+    from src.dust3r.inference import accumulate_poses
 
     # Only keep the outputs corresponding to one full pass.
     valid_length = len(outputs["pred"]) // revisit
@@ -315,99 +320,12 @@ def prepare_output(
     conf_other = [output["conf"].cpu() for output in outputs["pred"]]
     pts3ds_self = torch.cat(pts3ds_self_ls, 0)
 
-    # Determine pose accumulation method
-    if use_relative_pose is None:
-        # Auto-detect: check if relative_pose is available in predictions
-        use_relative_pose = any(
-            "relative_pose" in pred and pred.get("relative_pose") is not None
-            for pred in outputs["pred"]
-        )
-    elif use_relative_pose:
-        # User explicitly requested relative pose, check if available
-        has_relative_pose = any(
-            "relative_pose" in pred and pred.get("relative_pose") is not None
-            for pred in outputs["pred"]
-        )
-        if not has_relative_pose:
-            print(
-                "Warning: --use_relative_pose specified but relative_pose not found in model output. Falling back to camera_pose."
-            )
-            use_relative_pose = False
-
-    if use_relative_pose:
-        # Accumulate camera poses from relative_pose (4x4 matrix multiplication)
-        # Note: relative_pose is predicted relative to the previous UPDATED frame
-        #
-        # Reset interval logic:
-        # - Frame i with reset=True: relative_pose is still valid (computed before state reset)
-        # - Overlap frame (i') is removed from output
-        # - Frame i+1's relative_pose is relative to overlap frame = same image as frame i
-        # - So accumulation is naturally continuous, no special handling needed
-        pr_poses = []
-        prev_updated_T_c2w = None  # Pose of the last updated frame
-        curr_T_c2w = None  # Current accumulated pose
-
-        for i, (pred, view) in enumerate(zip(outputs["pred"], outputs["views"])):
-            # Check if this frame was an update frame
-            is_update_frame = (i == 0) or (i % update_interval == 0)
-
-            if i == 0:
-                # First frame: use identity matrix (world frame origin)
-                B = pred["pts3d_in_self_view"].shape[0]
-                curr_T_c2w = (
-                    torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(B, 1, 1)
-                )
-                prev_updated_T_c2w = curr_T_c2w.clone()
-            else:
-                # Subsequent frames: accumulate from relative_pose
-                # relative_pose is relative to the previous UPDATED frame
-                if "relative_pose" in pred and pred["relative_pose"] is not None:
-                    T_rel = pred["relative_pose"].clone().cpu()  # (B, 4, 4)
-                    # T_rel represents transform from current frame to previous updated frame
-                    # To get current frame pose: T_c2w_curr = T_c2w_prev_updated @ T_rel_inv
-                    T_rel_inv = torch.inverse(T_rel.float()).to(T_rel.dtype)
-                    curr_T_c2w = torch.bmm(prev_updated_T_c2w, T_rel_inv)
-                else:
-                    # If relative_pose is missing, keep previous pose
-                    pass
-
-                # Update prev_updated_T_c2w if this is an update frame
-                if is_update_frame:
-                    prev_updated_T_c2w = curr_T_c2w.clone()
-
-            pr_poses.append(curr_T_c2w.clone())
-
-        # Count how many frames were update frames
-        num_update_frames = sum(
-            1 for i in range(len(outputs["pred"])) if i == 0 or i % update_interval == 0
-        )
-        num_reset_frames = reset_mask.sum().item() if reset_mask.any() else 0
-        print(
-            f"Using accumulated camera poses from relative_pose ({len(pr_poses)} frames, {num_update_frames} update frames, {num_reset_frames} resets)"
-        )
-    else:
-        # Use direct camera_pose
-        pr_poses = [
-            pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-            for pred in outputs["pred"]
-        ]
-
-        # Handle reset: accumulate poses across reset boundaries using global camera poses
-        if reset_mask.any():
-            pr_poses = torch.cat(pr_poses, 0)
-            identity = torch.eye(4, device=pr_poses.device)
-            reset_poses = torch.where(
-                reset_mask.unsqueeze(-1).unsqueeze(-1), pr_poses, identity
-            )
-            cumulative_bases = matrix_cumprod(reset_poses)
-            shifted_bases = torch.cat(
-                [identity.unsqueeze(0), cumulative_bases[:-1]], dim=0
-            )
-            pr_poses = torch.einsum("bij,bjk->bik", shifted_bases, pr_poses)
-            # Convert back to list format
-            pr_poses = list(pr_poses.unsqueeze(1).unbind(0))
-
-        print(f"Using direct camera_pose ({len(pr_poses)} frames)")
+    pr_poses = accumulate_poses(
+        outputs["pred"],
+        views=outputs["views"],
+        use_relative_pose=use_relative_pose,
+        reset_mask=reset_mask,
+    )
     R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
     t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
 
@@ -574,7 +492,26 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, state_args = inference_recurrent(views, model, device)
+    use_keyframes = not getattr(args, 'no_auto_keyframe', False)
+
+    if use_keyframes:
+        from src.dust3r.inference import make_kf_only_callbacks
+        ref_frame_indices_fn, on_frame_processed, keyframe_indices, buffer_pruning_fn = make_kf_only_callbacks()
+    else:
+        ref_frame_indices_fn = None
+        on_frame_processed = None
+        keyframe_indices = set()
+        buffer_pruning_fn = None
+
+    outputs, state_args = inference_recurrent(
+        views, model, device,
+        ref_frame_indices_fn=ref_frame_indices_fn,
+        keyframe_indices=keyframe_indices if use_keyframes else None,
+        on_frame_processed=on_frame_processed,
+        buffer_pruning_fn=buffer_pruning_fn,
+    )
+    if use_keyframes:
+        print(f"  Adaptive keyframes: {len(keyframe_indices)} keyframes selected from {len(views)} frames")
     total_time = time.time() - start_time
     per_frame_time = total_time / len(views)
     print(
@@ -625,6 +562,7 @@ def run_inference(args):
         vis_threshold=args.vis_threshold,
         size=args.size,
         downsample_factor=args.downsample_factor,
+        keyframe_indices=keyframe_indices,
     )
     viewer.run()
 

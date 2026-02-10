@@ -3,9 +3,17 @@ import re
 from copy import deepcopy
 from pathlib import Path
 
+# Set matplotlib backend before importing evo (which imports matplotlib internally)
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Monkey-patch evo settings before importing evo.tools.plot
+from evo.tools import settings
+settings.SETTINGS.plot_backend = 'Agg'
+
 import evo.main_ape as main_ape
 import evo.main_rpe as main_rpe
-import matplotlib.pyplot as plt
 import numpy as np
 from evo.core import sync
 from evo.core.metrics import PoseRelation, Unit

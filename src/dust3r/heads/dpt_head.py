@@ -333,9 +333,8 @@ class DPTPts3dPoseWithRelativePose(nn.Module):
 
         if has_pose:
             in_dim = net.dec_embed_dim
-            num_prompt_tokens = getattr(net, 'num_prompt_tokens', 8)  # Default to 8 for backward compatibility
             self.pose_head = PoseDecoder(hidden_size=in_dim)
-            self.relative_pose_head = RelativePoseDecoder(hidden_size=in_dim, num_prompt_tokens=num_prompt_tokens)
+            self.relative_pose_head = RelativePoseDecoder(hidden_size=in_dim, num_prompt_tokens=1)
 
     def forward(self, x, img_info, **kwargs):
         if self.has_pose:
@@ -384,14 +383,17 @@ class DPTPts3dPoseWithRelativePose(nn.Module):
             if self.has_pose:
                 pose = postprocess_pose(pose, self.pose_mode)
                 final_output["camera_pose"] = pose  # B,7
+                ref_frame_indices = kwargs.get("ref_frame_indices")
                 if relative_poses is not None:
                     final_output["relative_poses"] = relative_poses       # (B, N, 4, 4)
                     final_output["relative_poses_valid"] = valid_mask      # (B, N)
                     final_output["relative_pose"] = relative_poses[:, 0]  # (B, 4, 4) backward compat
+                    final_output["ref_frame_indices"] = ref_frame_indices  # List[int]
                 else:
                     final_output["relative_poses"] = None
                     final_output["relative_poses_valid"] = None
                     final_output["relative_pose"] = None
+                    final_output["ref_frame_indices"] = None
                 cross_out = checkpoint(
                     self.dpt_cross,
                     x_cross,

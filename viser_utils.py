@@ -339,6 +339,7 @@ class PointCloudViewer:
         vis_threshold=1,
         size=512,
         downsample_factor=1,
+        keyframe_indices=None,
     ):
         self.model = model
         self.size=size
@@ -349,6 +350,7 @@ class PointCloudViewer:
         self.conf_list = conf_list
         self.vis_threshold = vis_threshold
         self.downsample_factor = downsample_factor
+        self.keyframe_indices = keyframe_indices or set()
         self.tt = lambda x: torch.from_numpy(x).float().to(device)
         self.pcs, self.all_steps = self.read_data(
             pc_list, color_list, conf_list, edge_color_list
@@ -687,6 +689,7 @@ class PointCloudViewer:
         fov = 2 * np.arctan(pp[0] / focal)
         aspect = pp[0] / pp[1]
         self.traj_list.append((q, t))
+        cam_color = (255, 165, 0) if step in self.keyframe_indices else (50, 205, 50)
         self.cam_handles.append(
             self.server.add_camera_frustum(
                 name=f"/frames/{step}/camera",
@@ -695,7 +698,7 @@ class PointCloudViewer:
                 wxyz=q,
                 position=t,
                 scale=0.1,
-                color=(50, 205, 50),
+                color=cam_color,
             )
         )
 

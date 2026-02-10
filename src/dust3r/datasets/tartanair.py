@@ -17,7 +17,7 @@ class TartanAir_Multi(BaseMultiViewDataset):
     def __init__(self, ROOT, *args, **kwargs):
         self.ROOT = ROOT
         self.video = True
-        self.is_metric = True
+        self.is_metric = False
         self.max_interval = 20
         super().__init__(*args, **kwargs)
         # loading all
@@ -137,7 +137,7 @@ class TartanAir_Multi(BaseMultiViewDataset):
 
             # generate img mask and raymap mask
             img_mask, ray_mask = self.get_img_and_ray_masks(
-                self.is_metric, v, rng, p=[0.75, 0.2, 0.05]
+                self.is_metric, v, rng, p=[1.0, 0.0, 0.0]
             )
 
             views.append(

@@ -48,6 +48,13 @@ def get_args_parser():
     parser.add_argument("--size", type=int, default="224")
 
     parser.add_argument(
+        "--model_update_type",
+        type=str,
+        default="cut3r",
+        help="model type for state update strategy: cut3r or ttt3r",
+    )
+
+    parser.add_argument(
         "--pose_eval_stride", default=1, type=int, help="stride for pose evaluation"
     )
     parser.add_argument("--shuffle", action="store_true", default=False)
@@ -67,6 +74,25 @@ def get_args_parser():
     parser.add_argument("--revisit", type=int, default=1)
     parser.add_argument("--freeze_state", action="store_true", default=False)
     parser.add_argument("--solve_pose", action="store_true", default=False)
+    parser.add_argument(
+        "--use_relative_pose",
+        action="store_true",
+        default=False,
+        help="Use relative pose accumulation + PGO instead of absolute camera_pose. "
+        "If not set, auto-detects based on model output.",
+    )
+    parser.add_argument(
+        "--no_relative_pose",
+        action="store_true",
+        default=False,
+        help="Force absolute camera_pose even if relative_pose is available.",
+    )
+    parser.add_argument(
+        "--skip_pgo",
+        action="store_true",
+        default=False,
+        help="Skip PGO optimization, use chain accumulation only.",
+    )
     return parser
 
 
@@ -82,7 +108,7 @@ def eval_pose_estimation(args, model, save_dir=None):
 
 
 def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=None):
-    from dust3r.inference import inference
+    from dust3r.inference import inference, inference_recurrent, make_kf_only_callbacks
 
     metadata = dataset_metadata.get(args.eval_dataset)
     anno_path = metadata.get("anno_path", None)
@@ -102,6 +128,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
     if save_dir is None:
         save_dir = args.output_dir
+    os.makedirs(save_dir, exist_ok=True)
 
     distributed_state = PartialState()
     model.to(distributed_state.device)
@@ -142,7 +169,26 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     revisit=args.revisit,
                     update=not args.freeze_state,
                 )
-                outputs, _ = inference(views, model, device)
+                # Keyframe selection (auto-detect: no-op if model lacks relative_poses)
+                ref_frame_indices_fn, on_frame_processed, keyframe_indices, buffer_pruning_fn = make_kf_only_callbacks()
+                outputs, _ = inference_recurrent(
+                    views, model, device,
+                    ref_frame_indices_fn=ref_frame_indices_fn,
+                    keyframe_indices=keyframe_indices,
+                    on_frame_processed=on_frame_processed,
+                    buffer_pruning_fn=buffer_pruning_fn,
+                )
+
+                # Determine use_relative_pose setting
+                if args.use_relative_pose and args.no_relative_pose:
+                    print("Warning: Both --use_relative_pose and --no_relative_pose specified. --no_relative_pose takes precedence.")
+                    use_rel = False
+                elif args.no_relative_pose:
+                    use_rel = False
+                elif args.use_relative_pose:
+                    use_rel = True
+                else:
+                    use_rel = None  # auto-detect
 
                 (
                     colors,
@@ -153,7 +199,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     cam_dict,
                     pr_poses,
                 ) = prepare_output(
-                    outputs, revisit=args.revisit, solve_pose=args.solve_pose
+                    outputs, revisit=args.revisit, solve_pose=args.solve_pose,
+                    use_relative_pose=use_rel, skip_pgo=args.skip_pgo,
                 )
 
                 pred_traj = get_tum_poses(pr_poses)
@@ -255,7 +302,6 @@ if __name__ == "__main__":
     from dust3r.utils.image import load_images_for_eval as load_images
     from dust3r.post_process import estimate_focal_knowing_depth
     from dust3r.model import ARCroco3DStereo
-    from dust3r.utils.camera import pose_encoding_to_camera
     from dust3r.utils.geometry import weighted_procrustes, geotrf
 
     args.full_seq = False
@@ -381,20 +427,23 @@ if __name__ == "__main__":
             return new_views
         return views
 
-    def prepare_output(outputs, revisit=1, solve_pose=False):
+    def prepare_output(outputs, revisit=1, solve_pose=False, use_relative_pose=None, skip_pgo=False):
+        from dust3r.inference import accumulate_poses
+
         valid_length = len(outputs["pred"]) // revisit
         outputs["pred"] = outputs["pred"][-valid_length:]
         outputs["views"] = outputs["views"][-valid_length:]
 
+        pts3ds_self = [
+            output["pts3d_in_self_view"].cpu() for output in outputs["pred"]
+        ]
+        pts3ds_other = [
+            output["pts3d_in_other_view"].cpu() for output in outputs["pred"]
+        ]
+        conf_self = [output["conf_self"].cpu() for output in outputs["pred"]]
+        conf_other = [output["conf"].cpu() for output in outputs["pred"]]
+
         if solve_pose:
-            pts3ds_self = [
-                output["pts3d_in_self_view"].cpu() for output in outputs["pred"]
-            ]
-            pts3ds_other = [
-                output["pts3d_in_other_view"].cpu() for output in outputs["pred"]
-            ]
-            conf_self = [output["conf_self"].cpu() for output in outputs["pred"]]
-            conf_other = [output["conf"].cpu() for output in outputs["pred"]]
             pr_poses, focal, pp = recover_cam_params(
                 torch.cat(pts3ds_self, 0),
                 torch.cat(pts3ds_other, 0),
@@ -403,20 +452,13 @@ if __name__ == "__main__":
             )
             pts3ds_self = torch.cat(pts3ds_self, 0)
         else:
-
-            pts3ds_self = [
-                output["pts3d_in_self_view"].cpu() for output in outputs["pred"]
-            ]
-            pts3ds_other = [
-                output["pts3d_in_other_view"].cpu() for output in outputs["pred"]
-            ]
-            conf_self = [output["conf_self"].cpu() for output in outputs["pred"]]
-            conf_other = [output["conf"].cpu() for output in outputs["pred"]]
             pts3ds_self = torch.cat(pts3ds_self, 0)
-            pr_poses = [
-                pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-                for pred in outputs["pred"]
-            ]
+            pr_poses = accumulate_poses(
+                outputs["pred"],
+                views=outputs["views"],
+                use_relative_pose=use_relative_pose,
+                skip_pgo=skip_pgo,
+            )
             pr_poses = torch.cat(pr_poses, 0)
 
             B, H, W, _ = pts3ds_self.shape
@@ -446,4 +488,5 @@ if __name__ == "__main__":
         )
 
     model = ARCroco3DStereo.from_pretrained(args.weights)
+    model.config.model_update_type = args.model_update_type
     eval_pose_estimation(args, model, save_dir=args.output_dir)
